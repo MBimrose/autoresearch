@@ -262,7 +262,7 @@ def evaluate_accuracy(model, val_loader, device="cuda"):
         device: Device to run evaluation on
     
     Returns:
-        Top-1 accuracy in percentage points [0, 100].
+        Top-1 accuracy as a decimal in [0, 1].
     """
     accuracy, _, _ = evaluate_accuracy_with_counts(model, val_loader, device)
     return accuracy
@@ -274,7 +274,7 @@ def evaluate_accuracy_with_counts(model, val_loader, device="cuda"):
     Compute top-1 accuracy and raw counts on the validation set.
 
     Returns:
-        Tuple of (accuracy_pct, correct, total), where accuracy_pct is in [0, 100].
+        Tuple of (accuracy, correct, total), where accuracy is in [0, 1].
     """
     model.eval()
     correct = 0
@@ -290,7 +290,7 @@ def evaluate_accuracy_with_counts(model, val_loader, device="cuda"):
         correct += (preds == labels).sum().item()
         total += labels.size(0)  # samples
     
-    accuracy = 100.0 * correct / total if total > 0 else 0.0
+    accuracy = correct / total if total > 0 else 0.0
     return accuracy, correct, total
 
 

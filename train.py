@@ -695,7 +695,7 @@ steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / 
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
-print(f"val_accuracy:     {val_accuracy:.6f}")  # percentage in [0, 100]
+print(f"val_accuracy:     {val_accuracy:.6f}")  # decimal in [0, 1]
 print(f"val_correct:      {val_correct}")
 print(f"val_total:        {val_total}")
 print(f"training_seconds: {total_training_time:.1f}")
