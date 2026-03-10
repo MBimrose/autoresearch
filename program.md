@@ -28,7 +28,7 @@ Each experiment runs on a single GPU. The training script runs for a **fixed tim
 **What you CANNOT do:**
 - Modify `prepare.py`. It is read-only. It contains the fixed evaluation, data loading, tokenizer, and training constants (time budget, sequence length, etc).
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
-- Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
+- Modify the evaluation harness. The `evaluate_accuracy` function in `prepare.py` is the ground truth metric.
 
 **The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time — it's always 5 minutes. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size. The only constraint is that the code runs without crashing and finishes within the time budget.
 
@@ -44,7 +44,7 @@ Once the script finishes it prints a summary like this:
 
 ```
 ---
-val_bpb:          0.997900
+val_accuracy:     0.997900
 training_seconds: 300.1
 total_seconds:    325.9
 peak_vram_mb:     45060.2
@@ -58,7 +58,7 @@ depth:            8
 Note that the script is configured to always stop after 5 minutes, so depending on the computing platform of this computer the numbers might look different. You can extract the key metric from the log file:
 
 ```
-grep "^val_bpb:" run.log
+grep "^val_accuracy:" run.log
 ```
 
 ## Logging results
@@ -68,11 +68,11 @@ When an experiment is done, log it to `results.tsv` (tab-separated, NOT comma-se
 The TSV has a header row and 5 columns:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	val_accuracy	memory_gb	status	description
 ```
 
 1. git commit hash (short, 7 chars)
-2. val_bpb achieved (e.g. 1.234567) — use 0.000000 for crashes
+2. val_accuracy achieved (e.g. 1.234567) — use 0.000000 for crashes
 3. peak memory in GB, round to .1f (e.g. 12.3 — divide peak_vram_mb by 1024) — use 0.0 for crashes
 4. status: `keep`, `discard`, or `crash`
 5. short text description of what this experiment tried
@@ -80,7 +80,7 @@ commit	val_bpb	memory_gb	status	description
 Example:
 
 ```
-commit	val_bpb	memory_gb	status	description
+commit	val_accuracy	memory_gb	status	description
 a1b2c3d	0.997900	44.0	keep	baseline
 b2c3d4e	0.993200	44.2	keep	increase LR to 0.04
 c3d4e5f	1.005000	44.0	discard	switch to GeLU activation
