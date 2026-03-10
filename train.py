@@ -21,7 +21,19 @@ from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
 # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
 repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
-fa3 = get_kernel(repo).flash_attn_interface
+
+# Try to load flash attention kernel, fallback to PyTorch's native FA2
+try:
+    fa_kernel = get_kernel(repo).flash_attn_interface
+    # Check if the expected function exists
+    if hasattr(fa_kernel, 'flash_attn_func'):
+        fa3 = fa_kernel.flash_attn_func
+    else:
+        print("Flash attention kernel loaded but missing flash_attn_func, using PyTorch FA2")
+        fa3 = None
+except Exception as e:
+    print(f"Failed to load flash attention kernel: {e}, using PyTorch FA2")
+    fa3 = None
 
 from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 
@@ -32,7 +44,7 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 @dataclass
 class ViTConfig:
     image_size: int = 64
-    patch_size: int = 5
+    patch_size: int = 8
     num_classes: int = 200
     n_layer: int = 12
     n_head: int = 8
@@ -87,7 +99,12 @@ class CausalSelfAttention(nn.Module):
         # Non-causal attention (bidirectional - all patches attend to all others)
         q, k = norm(q), norm(k)
         
-        y = fa3.flash_attn_func(q, k, v, causal=False)  # No causal masking for ViT
+        if fa3 is not None:
+            y = fa3(q, k, v, causal=False)  # No causal masking for ViT
+        else:
+            # Use PyTorch's native flash attention (FA2)
+            y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False)
+            y = y.transpose(1, 2).contiguous()
         y = y.contiguous().view(B, T, -1)
         y = F.linear(y, self.c_proj_weight)
         return y
@@ -436,13 +453,13 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-DEPTH = 8               # LOCKED IN: Best configuration (experiment 4)
-ASPECT_RATIO = 96       # increased model dimension (experiment 4 - more capacity)
-HEAD_DIM = 128          # locked in: best head dimension from experiment 4
+DEPTH = 4               # Number of transformer layers (baseline - fewer layers for faster training)
+ASPECT_RATIO = 96       # multiplier for model dimension
+HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
-# Optimization
-TOTAL_BATCH_SIZE = 2**15   # ~8K patches per optimizer step (~32 sample batches of 64 images each - reduced for smaller patches)
+# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
+TOTAL_BATCH_SIZE = 2**15   # ~32K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
 MATRIX_LR = 0.04           # learning rate for matrix parameters (Muon)
@@ -453,8 +470,7 @@ WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-#
-DEVICE_BATCH_SIZE = 512     # per-device batch size (reduced for VRAM constraints)
+DEVICE_BATCH_SIZE = 512     # per-device batch size (works with patch_size=8: 512*64=32768)
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
@@ -489,7 +505,7 @@ def build_model_config(depth):
     num_heads = model_dim // HEAD_DIM
     
     return ViTConfig(
-        image_size=64, patch_size=5, num_classes=get_num_classes(),
+        image_size=64, patch_size=8, num_classes=get_num_classes(),
         n_layer=depth, n_head=num_heads, n_embd=model_dim,
         window_pattern=WINDOW_PATTERN,
     )

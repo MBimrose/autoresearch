@@ -26,7 +26,7 @@ IMAGE_SIZE = 64           # image resolution (square)
 PATCH_SIZE = 8            # patch size for ViT
 NUM_CLASSES = 200         # TinyImageNet classes
 TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
-EVAL_SAMPLES = 500        # number of samples for val eval
+EVAL_SAMPLES = 10000        # number of samples for val eval
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -206,10 +206,12 @@ def create_val_dataset():
         labels_tensor = torch.tensor(labels_list[:EVAL_SAMPLES], dtype=torch.long)
         return images_tensor, labels_tensor
     
-    # Fallback: use part of training data as validation
-    train_images, train_labels = create_cached_dataset()
-    split_idx = min(500, len(train_images))
-    return train_images[:split_idx], train_labels[:split_idx]
+    # Never fall back to training samples for validation, this would leak data.
+    raise RuntimeError(
+        "Validation dataset is empty or unreadable. "
+        "Refusing to fall back to training samples. "
+        "Please verify data/tiny-imagenet-200/val and val_annotations.txt."
+    )
 
 
 # ---------------------------------------------------------------------------
