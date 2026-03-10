@@ -35,7 +35,7 @@ except Exception as e:
     print(f"Failed to load flash attention kernel: {e}, using PyTorch FA2")
     fa3 = None
 
-from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
+from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts
 
 # ---------------------------------------------------------------------------
 # Vision Transformer Model
@@ -459,7 +459,7 @@ HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**15   # ~32K patches per optimizer step
+TOTAL_BATCH_SIZE = 2**16   # ~64K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
 MATRIX_LR = 0.04           # learning rate for matrix parameters (Muon)
@@ -470,7 +470,7 @@ WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 512     # per-device batch size (works with patch_size=8: 512*64=32768)
+DEVICE_BATCH_SIZE = 1024     # per-device batch size (works with patch_size=8: 1024*64=65536)
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
@@ -685,7 +685,7 @@ val_loader = make_val_dataloader(val_images, val_labels, DEVICE_BATCH_SIZE)
 
 model.eval()
 with autocast_ctx:
-    val_accuracy = evaluate_accuracy(model, val_loader, device)
+    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
 
 
 # Final summary
@@ -695,7 +695,9 @@ steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / 
 peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
 
 print("---")
-print(f"val_accuracy:     {val_accuracy:.6f}")
+print(f"val_accuracy:     {val_accuracy:.6f}")  # percentage in [0, 100]
+print(f"val_correct:      {val_correct}")
+print(f"val_total:        {val_total}")
 print(f"training_seconds: {total_training_time:.1f}")
 print(f"total_seconds:    {t_end - t_start:.1f}")
 print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
