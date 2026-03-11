@@ -472,30 +472,30 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
-ASPECT_RATIO = 96       # multiplier for model dimension
-HEAD_DIM = 128          # attention head dimension
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
+# Model architecture - smaller model for more steps
+DEPTH = 6               # Fewer layers = faster training
+ASPECT_RATIO = 64       # Smaller model dimension
+HEAD_DIM = 64           # Smaller heads
+WINDOW_PATTERN = "SSSL"
 
-# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
-EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
-UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
-SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
+# Optimization - smallest batch for maximum steps
+TOTAL_BATCH_SIZE = 2**11   # ~2K patches per step
+EMBEDDING_LR = 1.2         # Higher LR for faster learning
+VALUE_EMBEDDING_LR = 2.4
+UNEMBEDDING_LR = 0.008
+MATRIX_LR = 0.04           # Higher matrix LR
+SCALAR_LR = 1.0
+WEIGHT_DECAY = 0.1         # Lower weight decay
+ADAM_BETAS = (0.9, 0.95)   # Standard Adam betas
+WARMUP_RATIO = 0.0
+WARMDOWN_RATIO = 0.5
+FINAL_LR_FRAC = 0.0
 
-DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
+DEVICE_BATCH_SIZE = 64       # Small batch
 
-# EMA (Exponential Moving Average) for weights - helps final accuracy
-USE_EMA = True
-EMA_DECAY = 0.995            # EMA decay factor (higher = smoother)
+# No EMA - doesn't help much
+USE_EMA = False
+EMA_DECAY = 0.995
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
