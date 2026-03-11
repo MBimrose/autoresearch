@@ -5,7 +5,7 @@ Vision Transformer variant of nanochat autoresearch.
 Usage: uv run train_vision.py
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 only
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 only
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -473,17 +473,17 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-DEPTH = 12              # Number of transformer layers (bigger model)
-ASPECT_RATIO = 192      # multiplier for model dimension (wider)
+DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
+ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**12   # ~4K patches per optimizer step (smaller batch for more steps)
+TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam)
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
@@ -491,13 +491,89 @@ WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 64       # per-device batch size (smaller for more steps)
+DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
+
+# Mixup + CutMix augmentation
+USE_MIXUP = True
+MIXUP_ALPHA = 0.2            # mixup alpha (0.2 = mild mixing)
+CUTMIX_ALPHA = 0.2           # cutmix alpha
+CUTMIX_MINMAX = (0.1, 0.9)   # cutmix crop size range
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
 
 # Training termination (set NUM_EPOCHS>0 to use epoch-based stopping)
 NUM_EPOCHS = 5
+
+
+# ---------------------------------------------------------------------------
+# Mixup and CutMix augmentation
+# ---------------------------------------------------------------------------
+
+def mixup(images, labels, alpha=MIXUP_ALPHA):
+    """Apply mixup augmentation: blend two random images and their labels."""
+    batch_size = images.shape[0]
+    lam = torch.distributions.Beta(alpha, alpha).sample((batch_size,)).to(images.device)
+    lam = lam.view(-1, 1, 1, 1)
+
+    # Random shuffle
+    shuffle_idx = torch.randperm(batch_size, device=images.device)
+    images_shuffled = images[shuffle_idx]
+    labels_shuffled = labels[shuffle_idx]
+
+    # Mix images and labels
+    mixed_images = lam * images + (1 - lam) * images_shuffled
+    return mixed_images, labels_shuffled, lam.squeeze()
+
+
+def cutmix(images, labels, alpha=CUTMIX_ALPHA, minmax=CUTMIX_MINMAX):
+    """Apply cutmix augmentation: paste random patch from another image."""
+    batch_size = images.shape[0]
+    lam = torch.distributions.Beta(alpha, alpha).sample((batch_size,)).to(images.device)
+
+    # Random shuffle
+    shuffle_idx = torch.randperm(batch_size, device=images.device)
+
+    # Compute cutmix mask
+    H, W = images.shape[2], images.shape[3]
+    cut_rat = torch.sqrt(1 - lam)
+    cut_h = (H * cut_rat).int()
+    cut_w = (W * cut_rat).int()
+
+    # Random crop coordinates
+    cx = torch.randint(0, H, (batch_size,), device=images.device)
+    cy = torch.randint(0, W, (batch_size,), device=images.device)
+
+    x1 = torch.clamp(cx - cut_h // 2, 0, H)
+    x2 = torch.clamp(cx + cut_h // 2, 0, H)
+    y1 = torch.clamp(cy - cut_w // 2, 0, W)
+    y2 = torch.clamp(cy + cut_w // 2, 0, W)
+
+    # Apply cutmix
+    mixed_images = images.clone()
+    for i in range(batch_size):
+        mixed_images[i, :, x1[i]:x2[i], y1[i]:y2[i]] = images[shuffle_idx[i], :, x1[i]:x2[i], y1[i]:y2[i]]
+
+    # Compute effective lambda (ratio of preserved area)
+    area_orig = H * W
+    area_cut = (x2 - x1) * (y2 - y1)
+    lam_eff = 1 - area_cut.float() / area_orig
+
+    return mixed_images, labels_shuffled, lam_eff
+
+
+def apply_augmentation(images, labels, training=True):
+    """Apply mixup or cutmix augmentation."""
+    if not training or not USE_MIXUP:
+        return images, labels
+
+    # Randomly choose mixup or cutmix (50/50)
+    if torch.rand(1) < 0.5:
+        images, shuffled_labels, lam = mixup(images, labels)
+    else:
+        images, shuffled_labels, lam = cutmix(images, labels)
+
+    return images, shuffled_labels, lam
 
 
 # ---------------------------------------------------------------------------
@@ -625,13 +701,24 @@ while True:
             # Move labels to the training device
             labels = labels.to(device)
 
-            logits = model(images_reshaped)
-            loss = F.cross_entropy(logits, labels)
-        
+            # Apply mixup/cutmix augmentation
+            if USE_MIXUP:
+                images_reshaped, shuffled_labels, lam = apply_augmentation(images_reshaped, labels)
+                # For mixup/cutmix, we need soft targets: lam * one_hot(labels) + (1-lam) * one_hot(shuffled_labels)
+                # Simplified: use cross entropy with label smoothing equivalent
+                logits = model(images_reshaped)
+                # Soft target: lam * log_softmax(logits)[labels] + (1-lam) * log_softmax(logits)[shuffled_labels]
+                log_probs = F.log_softmax(logits, dim=-1)
+                loss = -(lam * log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1) +
+                         (1 - lam) * log_probs.gather(-1, shuffled_labels.unsqueeze(-1)).squeeze(-1)).mean()
+            else:
+                logits = model(images_reshaped)
+                loss = F.cross_entropy(logits, labels)
+
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-        
+
         try:
             images, labels = next(train_loader_iter)
         except StopIteration:
