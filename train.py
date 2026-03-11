@@ -5,7 +5,7 @@ Vision Transformer variant of nanochat autoresearch.
 Usage: uv run train_vision.py
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 only
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 only
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -17,6 +17,7 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.distributions import Categorical
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -37,6 +38,73 @@ except Exception as e:
     fa3 = None
 
 from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts
+
+# ---------------------------------------------------------------------------
+# Data Augmentation (applied on-the-fly during training)
+# ---------------------------------------------------------------------------
+
+def random_horizontal_flip(x):
+    """Random horizontal flip with 50% probability."""
+    if torch.rand(1).item() < 0.5:
+        return x.flip(-1)
+    return x
+
+
+def random_crop(x, padding=4):
+    """Random crop with padding."""
+    B, C, H, W = x.shape
+    if padding > 0:
+        # Pad the image
+        x = F.pad(x, (padding, padding, padding, padding), mode='reflect')
+        # Random crop
+        top = torch.randint(0, 2 * padding + 1, (1,)).item()
+        left = torch.randint(0, 2 * padding + 1, (1,)).item()
+        x = x[:, :, top:top+H, left:left+W]
+    return x
+
+
+def color_jitter(x, brightness=0.2, contrast=0.2, saturation=0.2):
+    """Simple color jitter augmentation."""
+    # Brightness
+    if brightness > 0:
+        alpha = torch.empty(1).uniform_(1 - brightness, 1 + brightness).item()
+        x = x * alpha
+    # Contrast
+    if contrast > 0:
+        alpha = torch.empty(1).uniform_(1 - contrast, 1 + contrast).item()
+        x = x * alpha
+    # Saturation (approximate - scale chroma channels)
+    if saturation > 0:
+        alpha = torch.empty(1).uniform_(1 - saturation, 1 + saturation).item()
+        # Convert to HSV-like and scale saturation
+        # Simple approx: blend with grayscale
+        gray = x.mean(dim=1, keepdim=True)
+        x = gray + alpha * (x - gray)
+    return x.clamp(-2, 2)  # Clamp to reasonable range for ImageNet-normalized data
+
+
+def apply_augmentation(x):
+    """Apply all augmentations to a batch of images."""
+    x = random_crop(x, padding=4)
+    x = torch.stack([random_horizontal_flip(img) for img in x.unbind(0)])
+    x = color_jitter(x, brightness=0.2, contrast=0.2, saturation=0.1)
+    return x
+
+
+def label_smoothing_cross_entropy(logits, targets, smoothing=0.1):
+    """Cross entropy loss with label smoothing."""
+    num_classes = logits.shape[-1]
+    log_probs = F.log_softmax(logits, dim=-1)
+
+    # Create smoothed targets: (1 - smoothing) for correct class, smoothing / (K-1) for others
+    with torch.no_grad():
+        smooth_targets = torch.zeros_like(log_probs).scatter(-1, targets.unsqueeze(-1), 1.0)
+        smooth_targets = smooth_targets * (1 - smoothing) + (1 - smooth_targets) * (smoothing / (num_classes - 1))
+
+    # Compute loss
+    loss = -(smooth_targets * log_probs).sum(dim=-1).mean()
+    return loss
+
 
 # ---------------------------------------------------------------------------
 # Vision Transformer Model
@@ -493,6 +561,10 @@ FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
+# Data augmentation
+USE_AUGMENTATION = True      # enable/disable augmentations
+LABEL_SMOOTHING = 0.1        # label smoothing factor (0 = standard CE)
+
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
 
@@ -625,8 +697,17 @@ while True:
             # Move labels to the training device
             labels = labels.to(device)
 
+            # Apply data augmentation during training
+            if USE_AUGMENTATION:
+                images_reshaped = apply_augmentation(images_reshaped)
+
             logits = model(images_reshaped)
-            loss = F.cross_entropy(logits, labels)
+
+            # Use label smoothing or standard cross entropy
+            if LABEL_SMOOTHING > 0:
+                loss = label_smoothing_cross_entropy(logits, labels, LABEL_SMOOTHING)
+            else:
+                loss = F.cross_entropy(logits, labels)
         
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
