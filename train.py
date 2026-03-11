@@ -429,11 +429,11 @@ while True:
     t0 = time.time()
     
     for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            # Move images and labels to the training device
-            images = images.to(device)
-            labels = labels.to(device)
+        # Move images and labels to the training device with correct dtype
+        images = images.to(device=device, dtype=torch.float32)
+        labels = labels.to(device)
 
+        with autocast_ctx:
             logits = model(images)
             loss = F.cross_entropy(logits, labels)
         
