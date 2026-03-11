@@ -479,7 +479,9 @@ HEAD_DIM = 64           # Smaller heads
 WINDOW_PATTERN = "SSSL"
 
 # Optimization - smallest batch for maximum steps
-TOTAL_BATCH_SIZE = 2**11   # ~2K patches per step
+# tokens_per_fwdbwd = DEVICE_BATCH_SIZE * 64 patches = 64 * 64 = 4096
+# So TOTAL_BATCH_SIZE must be a multiple of 4096
+TOTAL_BATCH_SIZE = 2**12   # 4096 patches per step = 1 batch
 EMBEDDING_LR = 1.2         # Higher LR for faster learning
 VALUE_EMBEDDING_LR = 2.4
 UNEMBEDDING_LR = 0.008
