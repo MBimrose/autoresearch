@@ -291,7 +291,8 @@ BASE_CHANNELS = 64      # Base channel count
 WIDTH_MULTIPLIER = 2    # Width multiplier (1=baseline, 2=2x wider)
 
 # Optimization - ConvNet trains with SGD-style optimization
-TOTAL_BATCH_SIZE = 256     # Batch size
+DEVICE_BATCH_SIZE = 128    # Per-device batch size
+TOTAL_BATCH_SIZE = 256     # Total batch size (with grad accum)
 LEARNING_RATE = 0.1        # Initial learning rate (high for fast training)
 WEIGHT_DECAY = 1e-4        # Standard weight decay
 MOMENTUM = 0.9             # SGD momentum
