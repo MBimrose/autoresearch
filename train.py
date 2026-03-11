@@ -59,9 +59,7 @@ def norm(x):
 
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    # ABLATION: return False to disable value embeddings
-    # return layer_idx % 2 == (n_layer - 1) % 2  # original
-    return False  # ABLATION: no value embeddings
+    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 class CausalSelfAttention(nn.Module):
@@ -473,7 +471,7 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
+DEPTH = 12              # Number of transformer layers (testing deeper model with VE)
 ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
