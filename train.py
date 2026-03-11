@@ -478,23 +478,23 @@ ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
-# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
+# Optimization - tuned for maximum accuracy
+TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
-UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam)
+UNEMBEDDING_LR = 0.02      # 5x higher LR for head - let head learn faster!
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
+WARMUP_RATIO = 0.0
+WARMDOWN_RATIO = 0.5
+FINAL_LR_FRAC = 0.0
 
 DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
 # Label smoothing for better generalization
-LABEL_SMOOTHING = 0.05       # mild label smoothing (0 = standard CE)
+LABEL_SMOOTHING = 0.1        # stronger label smoothing
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
