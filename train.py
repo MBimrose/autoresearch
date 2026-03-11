@@ -331,10 +331,12 @@ class VisionTransformer(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         value_embed_params = [ve for ve in self.value_embeddings if ve is not None]
+        # Conv stem parameters (if enabled) - use AdamW with embedding LR
+        stem_params = list(self.conv_stem.parameters()) if self.conv_stem is not None else []
 
         assert len(list(self.parameters())) == (len(head_params) + len(patch_embed_params) +
             len(cls_token_params) + len(pos_embed_params) + len(matrix_params) +
-            len(resid_params) + len(x0_params) + len(value_embed_params))
+            len(resid_params) + len(x0_params) + len(value_embed_params) + len(stem_params))
 
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -350,6 +352,8 @@ class VisionTransformer(nn.Module):
             dict(kind='adamw', params=pos_embed_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embed_params, lr=value_embedding_lr * dmodel_lr_scale,
+                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=stem_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
