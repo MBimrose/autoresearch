@@ -420,12 +420,11 @@ while True:
     
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            # Images are already in (B, C, H, W) format from dataloader
-            images_reshaped = images
-            # Move labels to the training device
+            # Move images and labels to the training device
+            images = images.to(device)
             labels = labels.to(device)
 
-            logits = model(images_reshaped)
+            logits = model(images)
             loss = F.cross_entropy(logits, labels)
         
         train_loss = loss.detach()
