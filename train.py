@@ -5,7 +5,7 @@ Vision Transformer variant of nanochat autoresearch.
 Usage: uv run train_vision.py
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 only
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 only
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -17,7 +17,6 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.distributions import Beta
 
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
@@ -475,18 +474,18 @@ class MuonAdamW(torch.optim.Optimizer):
 
 # Model architecture
 DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
-ASPECT_RATIO = 96       # multiplier for model dimension
+ASPECT_RATIO = 192      # multiplier for model dimension (increased from 96 for wider model)
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
 TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
-EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
-UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
-SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
+EMBEDDING_LR = 0.4         # learning rate for patch embeddings (Adam) - scaled down for wider model
+VALUE_EMBEDDING_LR = 0.8   # learning rate for value embeddings (Adam) - scaled down
+UNEMBEDDING_LR = 0.003     # learning rate for head (Adam) - scaled down
+MATRIX_LR = 0.015          # learning rate for matrix parameters (Muon) - scaled down for wider model
+SCALAR_LR = 0.3            # learning rate for per-layer scalars (Adam) - scaled down
+WEIGHT_DECAY = 0.15        # weight decay for Muon - slightly lower for wider model
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
 WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
@@ -494,106 +493,11 @@ FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
-# Data augmentation
-USE_AUGMENTATION = True      # enable/disable augmentation
-MIXUP_ALPHA = 0.0            # mixup alpha (0 = no mixup, try 0.2 later)
-LABEL_SMOOTHING = 0.0        # label smoothing epsilon (try 0.1 later)
-AUGMENT_SCALE = 0.5          # strength of augmentation (reduced)
-
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
 
 # Training termination (set NUM_EPOCHS>0 to use epoch-based stopping)
 NUM_EPOCHS = 5
-
-
-# ---------------------------------------------------------------------------
-# Data augmentation functions
-# ---------------------------------------------------------------------------
-
-def random_flip_lr(images):
-    """Random horizontal flip."""
-    mask = torch.rand(images.shape[0], 1, 1, 1, device=images.device) < 0.5
-    return images.flip(-1).mul(mask) + images.mul(~mask)
-
-
-def random_crop(images, scale=0.1):
-    """Random resized crop using grid_sample."""
-    B, C, H, W = images.shape
-    for i in range(B):
-        new_size = int((H * (1 - scale)) + torch.rand(1).item() * H * scale)
-        new_size = max(new_size, 8)
-        h = torch.randint(0, H - new_size + 1, (1,)).item()
-        w = torch.randint(0, W - new_size + 1, (1,)).item()
-        # Simple crop and resize using interpolation
-        cropped = images[i:i+1, :, h:h+new_size, w:w+new_size]
-        images[i] = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)[0]
-    return images
-
-
-def color_jitter(images, brightness=0.2, contrast=0.2, saturation=0.2):
-    """Random color jitter."""
-    B, C, H, W = images.shape
-    for i in range(B):
-        if torch.rand(1) < 0.5:
-            factor = 0.5 + torch.rand(1).item() * brightness
-            images[i] = images[i].clamp(0, 1) * factor
-        if torch.rand(1) < 0.5:
-            factor = 0.8 + torch.rand(1).item() * contrast
-            mean = images[i].mean(dim=(1, 2), keepdim=True)
-            images[i] = (images[i] - mean) * factor + mean
-    return images.clamp(0, 1)
-
-
-def cutmix(images, labels, alpha=0.2):
-    """CutMix augmentation: mix images by cutting and pasting patches."""
-    if alpha <= 0:
-        return images, labels, labels, torch.ones(labels.shape[0], device=labels.device)
-
-    B, C, H, W = images.shape
-    lam = Beta(alpha, alpha).sample()
-
-    # Random shuffle for mixing
-    rand_index = torch.randperm(B, device=images.device)
-
-    # Generate random cut coordinates
-    cut_rat = (1 - lam) ** 0.5
-    cut_w = int(W * cut_rat)
-    cut_h = int(H * cut_rat)
-
-    cx = torch.randint(0, W, (1,)).item()
-    cy = torch.randint(0, H, (1,)).item()
-
-    x0 = max(0, cx - cut_w // 2)
-    y0 = max(0, cy - cut_h // 2)
-    x1 = min(W, x0 + cut_w)
-    y1 = min(H, y0 + cut_h)
-
-    # Apply cutmix
-    images[:, :, y0:y1, x0:x1] = images[rand_index, :, y0:y1, x0:x1]
-
-    # Compute lambda for labels
-    lam = 1 - ((x1 - x0) * (y1 - y0)) / (H * W)
-    lam = torch.tensor([lam] * B, device=labels.device)
-
-    return images, labels, labels[rand_index], lam
-
-
-def augment_batch(images, labels, training=True):
-    """Apply augmentation to a batch of images."""
-    if not training or not USE_AUGMENTATION:
-        return images, labels, labels, torch.ones(labels.shape[0], device=labels.device)
-
-    # Apply simple flip augmentation only (most effective and stable)
-    images = random_flip_lr(images)
-
-    # Apply CutMix if enabled
-    if MIXUP_ALPHA > 0:
-        images, labels_a, labels_b, lam = cutmix(images, labels, alpha=MIXUP_ALPHA)
-    else:
-        labels_a, labels_b, lam = labels, labels, torch.ones(labels.shape[0], device=labels.device)
-
-    return images, labels_a, labels_b, lam
 
 
 # ---------------------------------------------------------------------------
@@ -713,37 +617,21 @@ samples_seen = 0
 while True:
     torch.cuda.synchronize()
     t0 = time.time()
-
+    
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             # Images are already in (B, C, H, W) format from dataloader
-            # Apply augmentation and get mixed labels
-            images_aug, labels_a, labels_b, lam = augment_batch(images, labels.to(device), training=True)
+            images_reshaped = images
+            # Move labels to the training device
+            labels = labels.to(device)
 
-            logits = model(images_aug)
-
-            # Loss with label smoothing and CutMix
-            if LABEL_SMOOTHING > 0:
-                # Label smoothing with CutMix
-                log_probs = F.log_softmax(logits, dim=-1)
-                n_classes = logits.shape[-1]
-                # Smoothed labels for class a
-                smooth_a = F.one_hot(labels_a, n_classes).float() * (1 - LABEL_SMOOTHING) + LABEL_SMOOTHING / n_classes
-                # Smoothed labels for class b
-                smooth_b = F.one_hot(labels_b, n_classes).float() * (1 - LABEL_SMOOTHING) + LABEL_SMOOTHING / n_classes
-                # Mix the smoothed labels
-                mixed_labels = lam[:, None] * smooth_a + (1 - lam[:, None]) * smooth_b
-                loss = -(mixed_labels * log_probs).sum(dim=-1).mean()
-            else:
-                # Simple CutMix loss without label smoothing
-                loss_a = F.cross_entropy(logits, labels_a, reduction='none')
-                loss_b = F.cross_entropy(logits, labels_b, reduction='none')
-                loss = (lam * loss_a + (1 - lam) * loss_b).mean()
-
+            logits = model(images_reshaped)
+            loss = F.cross_entropy(logits, labels)
+        
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
         loss.backward()
-
+        
         try:
             images, labels = next(train_loader_iter)
         except StopIteration:
