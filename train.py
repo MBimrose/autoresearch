@@ -373,6 +373,8 @@ optimizer = model.setup_optimizer(lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, m
 # model = torch.compile(model, dynamic=False)
 
 # Create dataloaders directly to avoid multiprocessing issues
+# Ensure float32 precision for images
+train_images = train_images.float()
 train_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
 train_loader = torch.utils.data.DataLoader(
     train_dataset,
