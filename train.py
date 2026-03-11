@@ -19,10 +19,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.distributions import Beta
 
-# Data augmentation imports
-import torchvision.transforms as T
-from torchvision.transforms import functional as TF
-
 from kernels import get_kernel
 cap = torch.cuda.get_device_capability()
 # varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
@@ -522,14 +518,16 @@ def random_flip_lr(images):
 
 
 def random_crop(images, scale=0.1):
-    """Random resized crop."""
+    """Random resized crop using grid_sample."""
     B, C, H, W = images.shape
     for i in range(B):
         new_size = int((H * (1 - scale)) + torch.rand(1).item() * H * scale)
         new_size = max(new_size, 8)
         h = torch.randint(0, H - new_size + 1, (1,)).item()
         w = torch.randint(0, W - new_size + 1, (1,)).item()
-        images[i] = TF.resize(images[i:i+1, :, h:h+new_size, w:w+new_size], (H, W), antialias=True)[0]
+        # Simple crop and resize using interpolation
+        cropped = images[i:i+1, :, h:h+new_size, w:w+new_size]
+        images[i] = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)[0]
     return images
 
 
