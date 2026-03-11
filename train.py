@@ -262,10 +262,13 @@ class VisionTransformer(nn.Module):
             x = self.conv_stem(x)
             # Now x is (B, STEM_CHANNELS, 16, 16)
 
+        B, C, H, W = x.size()
+
         # Patchify: (B, C', H', W') -> (B, num_patches, patch_dim)
         patches = x.unfold(2, self.config.patch_size, self.config.patch_size).unfold(3,
                       self.config.patch_size, self.config.patch_size)
-        patches = patches.contiguous().view(B, -1, -1)  # (B, num_patches, patch_dim)
+        patch_dim = C * self.config.patch_size * self.config.patch_size
+        patches = patches.contiguous().view(B, -1, patch_dim)  # (B, num_patches, patch_dim)
 
         # Project to embedding dimension: (B, num_patches, patch_dim) -> (B, num_patches, n_embd)
         x = F.linear(patches, self.patch_embed_weight)
