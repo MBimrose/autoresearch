@@ -711,6 +711,8 @@ while True:
                 logits = model(images_reshaped)
                 # Soft target: lam * log_softmax(logits)[labels] + (1-lam) * log_softmax(logits)[shuffled_labels]
                 log_probs = F.log_softmax(logits, dim=-1)
+                # Ensure lam is on the right device
+                lam = lam.to(device)
                 loss = -(lam * log_probs.gather(-1, labels.unsqueeze(-1)).squeeze(-1) +
                          (1 - lam) * log_probs.gather(-1, shuffled_labels.unsqueeze(-1)).squeeze(-1)).mean()
             else:
