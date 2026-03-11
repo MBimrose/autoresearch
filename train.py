@@ -480,84 +480,24 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not us
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
 TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
-EMBEDDING_LR = 0.1         # learning rate for patch embeddings (Adam) - reduced
-VALUE_EMBEDDING_LR = 0.2   # learning rate for value embeddings (Adam) - reduced
+EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.005          # learning rate for matrix parameters (Muon) - reduced
-SCALAR_LR = 0.1            # learning rate for per-layer scalars (Adam) - reduced
-WEIGHT_DECAY = 0.1         # cautious weight decay for Muon - reduced
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
+SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.05        # fraction of time budget for LR warmup - added warmup
+WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
-
-# EMA (Exponential Moving Average) for evaluation
-USE_EMA = True             # maintain EMA of weights for final evaluation
-EMA_DECAY = 0.999          # EMA decay rate (higher = more smoothing)
-
-# Data augmentation - stronger pipeline
-USE_AUGMENTATION = True    # enable augmentation
-AUGMENT_SCALE = 0.15       # random crop scale (0.15 = crop 85-100% of image)
-COLOR_JITTER = True        # enable color jitter
-FLIP_PROB = 0.5            # horizontal flip probability
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
 
 # Training termination (set NUM_EPOCHS>0 to use epoch-based stopping)
 NUM_EPOCHS = 5
-
-
-# ---------------------------------------------------------------------------
-# Data augmentation functions
-# ---------------------------------------------------------------------------
-
-def random_flip_lr(images, prob=0.5):
-    """Random horizontal flip."""
-    mask = torch.rand(images.shape[0], 1, 1, 1, device=images.device) < prob
-    return images.flip(-1).mul(mask) + images.mul(~mask)
-
-
-def random_crop(images, scale=0.15):
-    """Random resized crop using interpolation."""
-    B, C, H, W = images.shape
-    output = torch.empty_like(images)
-    for i in range(B):
-        new_size = int(H * (1 - scale * torch.rand(1).item()))
-        new_size = max(new_size, 8)
-        h = torch.randint(0, H - new_size + 1, (1,)).item()
-        w = torch.randint(0, W - new_size + 1, (1,)).item()
-        cropped = images[i:i+1, :, h:h+new_size, w:w+new_size]
-        output[i] = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)[0]
-    return output
-
-
-def color_jitter(images, brightness=0.2, contrast=0.2, saturation=0.2):
-    """Random color jitter."""
-    B, C, H, W = images.shape
-    output = images.clone()
-    for i in range(B):
-        if torch.rand(1) < 0.5:
-            factor = 0.5 + torch.rand(1).item() * brightness
-            output[i] = output[i].clamp(0, 1) * factor
-        if torch.rand(1) < 0.5:
-            factor = 0.8 + torch.rand(1).item() * contrast
-            mean = output[i].mean(dim=(1, 2), keepdim=True)
-            output[i] = (output[i] - mean) * factor + mean
-    return output.clamp(0, 1)
-
-
-def augment_batch(images, training=True):
-    """Apply augmentation to a batch of images."""
-    if not training or not USE_AUGMENTATION:
-        return images
-    images = random_crop(images, scale=AUGMENT_SCALE)
-    if COLOR_JITTER:
-        images = color_jitter(images)
-    images = random_flip_lr(images, prob=FLIP_PROB)
-    return images
 
 
 # ---------------------------------------------------------------------------
@@ -599,17 +539,6 @@ model = VisionTransformer(config, device=device)
 
 # Initialize weights
 model.init_weights()
-
-# Initialize EMA model if enabled
-if USE_EMA:
-    print(f"Initializing EMA with decay={EMA_DECAY}...")
-    model_ema = VisionTransformer(config, device=device)
-    with torch.no_grad():
-        for ema_param, param in zip(model_ema.parameters(), model.parameters()):
-            ema_param.data.copy_(param.data)
-    model_ema.eval()
-else:
-    model_ema = None
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -692,12 +621,11 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             # Images are already in (B, C, H, W) format from dataloader
-            # Apply augmentation
-            images_aug = augment_batch(images, training=True)
+            images_reshaped = images
             # Move labels to the training device
             labels = labels.to(device)
 
-            logits = model(images_aug)
+            logits = model(images_reshaped)
             loss = F.cross_entropy(logits, labels)
         
         train_loss = loss.detach()
@@ -723,13 +651,6 @@ while True:
             group["weight_decay"] = muon_weight_decay
     
     optimizer.step()
-
-    # Update EMA after optimizer step
-    if USE_EMA and model_ema is not None:
-        with torch.no_grad():
-            for ema_param, param in zip(model_ema.parameters(), model.parameters()):
-                ema_param.mul_(EMA_DECAY).add_(param, alpha=1 - EMA_DECAY)
-
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -784,11 +705,9 @@ if val_images is None or val_labels is None:
 
 val_loader = make_val_dataloader(val_images, val_labels, DEVICE_BATCH_SIZE)
 
-# Evaluate with EMA model if enabled, otherwise use main model
-eval_model = model_ema if USE_EMA and model_ema is not None else model
-eval_model.eval()
+model.eval()
 with autocast_ctx:
-    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(eval_model, val_loader, device)
+    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
 
 
 # Final summary
