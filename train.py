@@ -533,6 +533,7 @@ def cutmix(images, labels, alpha=CUTMIX_ALPHA, minmax=CUTMIX_MINMAX):
 
     # Random shuffle
     shuffle_idx = torch.randperm(batch_size, device=images.device)
+    labels_shuffled = labels[shuffle_idx]
 
     # Compute cutmix mask
     H, W = images.shape[2], images.shape[3]
