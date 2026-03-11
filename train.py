@@ -483,11 +483,11 @@ TOTAL_BATCH_SIZE = 2**16   # ~64K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
 VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.025          # learning rate for matrix parameters (Muon) - fine tuning
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.3         # cautious weight decay for Muon - trying higher
+WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
+WARMUP_RATIO = 0.1         # fraction of time budget for LR warmup - trying 10% warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
