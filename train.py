@@ -163,6 +163,13 @@ class VisionTransformer(nn.Module):
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, device=device))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, device=device))
 
+        # Value embeddings for alternating layers (learned per-layer embeddings)
+        self.value_embeddings = nn.ModuleList([
+            nn.Parameter(torch.zeros(1, num_tokens, config.n_embd, device=device))
+            if has_ve(i, config.n_layer) else None
+            for i in range(config.n_layer)
+        ])
+
     def init_weights(self):
         # Patch embedding init
         torch.nn.init.normal_(self.patch_embed_weight, mean=0.0, std=0.02)
@@ -188,11 +195,16 @@ class VisionTransformer(nn.Module):
         # Per-layer scalars (use data access to avoid in-place grad op error)
         self.resid_lambdas.data.fill_(1.0)
         self.x0_lambdas.data.fill_(0.1)
-        
+
         # Value embedding init
         for block in self.blocks:
             if block.attn.ve_gate_weight is not None:
                 torch.nn.init.zeros_(block.attn.ve_gate_weight)
+
+        # Initialize value embeddings
+        for ve in self.value_embeddings:
+            if ve is not None:
+                ve.data.normal_(mean=0.0, std=0.02)
 
     def forward(self, x):
         """
@@ -220,11 +232,11 @@ class VisionTransformer(nn.Module):
         # Add positional embeddings (cast pos_embed to model dtype)
         x = x + self.pos_embed.to(device=x.device, dtype=x.dtype)
         
-        # Apply transformer blocks with residual connections
+        # Apply transformer blocks with residual connections and value embeddings
         x0 = x
         for i, block in enumerate(self.blocks):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = None  # Value embeddings not used in this simplified version
+            ve = self.value_embeddings[i] if self.value_embeddings[i] is not None else None
             x = block(x, ve)
         
         # Mean pooling over all patches (simple and effective for ViT)
