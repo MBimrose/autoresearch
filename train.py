@@ -141,42 +141,17 @@ class VisionTransformer(nn.Module):
     def __init__(self, config, device="cuda"):
         super().__init__()
         self.config = config
-        self.use_conv_stem = USE_CONV_STEM
-
-        # Convolutional stem (optional) - helps ViT learn local features faster
-        if self.use_conv_stem:
-            # Two 3x3 conv layers that reduce spatial dim by 4x (64 -> 16)
-            self.conv_stem = nn.Sequential(
-                nn.Conv2d(3, STEM_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False, device=device),
-                nn.BatchNorm2d(STEM_CHANNELS, device=device),
-                nn.GELU(),
-                nn.Conv2d(STEM_CHANNELS, STEM_CHANNELS, kernel_size=3, stride=2, padding=1, bias=False, device=device),
-                nn.BatchNorm2d(STEM_CHANNELS, device=device),
-                nn.GELU(),
-            ).to(device)
-            # After stem: (B, STEM_CHANNELS, 16, 16)
-            # Patch embedding now takes STEM_CHANNELS * patch_size^2 input
-            patch_dim = STEM_CHANNELS * config.patch_size * config.patch_size
-            self.patch_embed_weight = nn.Parameter(torch.empty(config.n_embd, patch_dim, device=device))
-        else:
-            self.conv_stem = None
-            # Original patch embedding: 3 * patch_size^2
-            patch_dim = 3 * config.patch_size * config.patch_size
-            self.patch_embed_weight = nn.Parameter(torch.empty(config.n_embd, patch_dim, device=device))
+        
+        # Patch embedding: project flattened patches to embedding dimension (no bias)
+        patch_dim = 3 * config.patch_size * config.patch_size  # RGB channels + patch area
+        self.patch_embed_weight = nn.Parameter(torch.empty(config.n_embd, patch_dim, device=device))
         
         # Mean pooling over patches (keep simple and effective - no class token)
         self.cls_token = False
-
-        # Calculate num_patches based on whether conv stem is used
-        # Conv stem reduces spatial dim by 4x (64 -> 16), then patchify with patch_size=8 -> 2x2 = 4 tokens
-        # Without stem: 64/8 = 8, so 8x8 = 64 tokens
-        if self.use_conv_stem:
-            stem_output_size = config.image_size // 4  # 64 -> 16
-            num_patches = (stem_output_size // config.patch_size) ** 2  # 16/8 = 2, so 2x2 = 4 tokens
-        else:
-            num_patches = (config.image_size // config.patch_size) ** 2  # 64/8 = 8, so 8x8 = 64 tokens
+        
+        num_patches = (config.image_size // config.patch_size) ** 2
         num_tokens = num_patches  # No class token, just patch tokens
-
+        
         self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, config.n_embd, device=device))
         
         # Transformer blocks
@@ -198,18 +173,9 @@ class VisionTransformer(nn.Module):
         ])
 
     def init_weights(self):
-        # Conv stem init (if enabled)
-        if self.conv_stem is not None:
-            for m in self.conv_stem.modules():
-                if isinstance(m, nn.Conv2d):
-                    torch.nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-                elif isinstance(m, nn.BatchNorm2d):
-                    torch.nn.init.ones_(m.weight)
-                    torch.nn.init.zeros_(m.bias)
-
         # Patch embedding init
         torch.nn.init.normal_(self.patch_embed_weight, mean=0.0, std=0.02)
-
+        
         # Positional embedding init
         self.pos_embed.data.normal_(mean=0.0, std=0.01)
         
@@ -244,32 +210,24 @@ class VisionTransformer(nn.Module):
 
     def forward(self, x):
         """
-        Forward pass for Vision Transformer with optional conv stem.
-
+        Forward pass for Vision Transformer.
+        
         Args:
             x: Input tensor of shape (B, C, H, W) - images with ImageNet normalization
-
+        
         Returns:
             Logits of shape (B, num_classes)
         """
         # Move input to the same device and dtype as model parameters
         x = x.to(device=self.patch_embed_weight.device, dtype=self.patch_embed_weight.dtype)
-
+        
         B, C, H, W = x.size()
-
-        # Apply conv stem if enabled (reduces spatial dim by 4x: 64 -> 16)
-        if self.conv_stem is not None:
-            x = self.conv_stem(x)
-            # Now x is (B, STEM_CHANNELS, 16, 16)
-
-        B, C, H, W = x.size()
-
-        # Patchify: (B, C', H', W') -> (B, num_patches, patch_dim)
-        patches = x.unfold(2, self.config.patch_size, self.config.patch_size).unfold(3,
-                      self.config.patch_size, self.config.patch_size)
-        patch_dim = C * self.config.patch_size * self.config.patch_size
-        patches = patches.contiguous().view(B, -1, patch_dim)  # (B, num_patches, patch_dim)
-
+        
+        # Patchify: (B, C, H, W) -> (B, num_patches, patch_dim)
+        patches = x.unfold(2, self.config.patch_size, self.config.patch_size).unfold(3, 
+                      self.config.patch_size, self.config.patch_size)  # (B, C, nH, nW, p, p)
+        patches = patches.contiguous().view(B, -1, C * self.config.patch_size * self.config.patch_size)
+        
         # Project to embedding dimension: (B, num_patches, patch_dim) -> (B, num_patches, n_embd)
         x = F.linear(patches, self.patch_embed_weight)
         
@@ -334,12 +292,10 @@ class VisionTransformer(nn.Module):
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
         value_embed_params = [ve for ve in self.value_embeddings if ve is not None]
-        # Conv stem parameters (if enabled) - use AdamW with embedding LR
-        stem_params = list(self.conv_stem.parameters()) if self.conv_stem is not None else []
 
         assert len(list(self.parameters())) == (len(head_params) + len(patch_embed_params) +
             len(cls_token_params) + len(pos_embed_params) + len(matrix_params) +
-            len(resid_params) + len(x0_params) + len(value_embed_params) + len(stem_params))
+            len(resid_params) + len(x0_params) + len(value_embed_params))
 
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -355,8 +311,6 @@ class VisionTransformer(nn.Module):
             dict(kind='adamw', params=pos_embed_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=value_embed_params, lr=value_embedding_lr * dmodel_lr_scale,
-                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=stem_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -518,30 +472,26 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture
-DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
-ASPECT_RATIO = 96       # multiplier for model dimension
+# Model architecture - smaller for more steps
+DEPTH = 6               # Fewer layers = faster
+ASPECT_RATIO = 64       # Smaller dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
-# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
-EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
-UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
-SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
+# Optimization - maximize steps with tiny batch
+TOTAL_BATCH_SIZE = 2**10   # ~1K patches per optimizer step
+EMBEDDING_LR = 1.0         # Higher LR for patch embeddings
+VALUE_EMBEDDING_LR = 2.0   # Higher LR for value embeddings
+UNEMBEDDING_LR = 0.01      # Higher LR for head
+MATRIX_LR = 0.04           # Higher LR for matrix params
+SCALAR_LR = 1.0            # Higher LR for scalars
+WEIGHT_DECAY = 0.1         # Lower weight decay
+ADAM_BETAS = (0.9, 0.95)   # Adam beta1, beta2
 WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
-
-# Conv stem - adds convolutional layers before ViT for better local feature extraction
-USE_CONV_STEM = True       # Use 2-layer conv stem before patch embedding
-STEM_CHANNELS = 64         # Intermediate channels for conv stem
+DEVICE_BATCH_SIZE = 16       # Tiny batch for maximum steps
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
