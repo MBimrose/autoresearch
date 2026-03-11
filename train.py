@@ -372,8 +372,15 @@ optimizer = model.setup_optimizer(lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, m
 
 # model = torch.compile(model, dynamic=False)
 
-# Create dataloaders (note: images come as (B, C, H, W), need to reshape for model)
-train_loader = make_dataloader(train_images, train_labels, DEVICE_BATCH_SIZE, shuffle=True)
+# Create dataloaders directly to avoid multiprocessing issues
+train_dataset = torch.utils.data.TensorDataset(train_images, train_labels)
+train_loader = torch.utils.data.DataLoader(
+    train_dataset,
+    batch_size=DEVICE_BATCH_SIZE,
+    shuffle=True,
+    num_workers=0,
+    pin_memory=False
+)
 train_loader_iter = iter(train_loader)
 
 print(f"Time budget: {TIME_BUDGET}s")
