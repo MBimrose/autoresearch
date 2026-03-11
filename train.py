@@ -92,7 +92,8 @@ class ResNet(nn.Module):
         channels = [config.base_channels * (2**i) * config.width_multiplier
                     for i in range(4)]
 
-        self.stage1 = Stage(3, channels[0], config.block_depth, stride=1, device=device)
+        # conv1 outputs channels[0], so stage1 takes channels[0] as input
+        self.stage1 = Stage(channels[0], channels[0], config.block_depth, stride=1, device=device)
         self.stage2 = Stage(channels[0], channels[1], config.block_depth, stride=2, device=device)
         self.stage3 = Stage(channels[1], channels[2], config.block_depth, stride=2, device=device)
         self.stage4 = Stage(channels[2], channels[3], config.block_depth, stride=2, device=device)
