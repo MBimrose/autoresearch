@@ -164,7 +164,7 @@ class VisionTransformer(nn.Module):
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, device=device))
 
         # Value embeddings for alternating layers (learned per-layer embeddings)
-        self.value_embeddings = nn.ModuleList([
+        self.value_embeddings = nn.ParameterList([
             nn.Parameter(torch.zeros(1, num_tokens, config.n_embd, device=device))
             if has_ve(i, config.n_layer) else None
             for i in range(config.n_layer)
