@@ -558,6 +558,7 @@ def cutmix(images, labels, alpha=CUTMIX_ALPHA, minmax=CUTMIX_MINMAX):
     area_orig = H * W
     area_cut = (x2 - x1) * (y2 - y1)
     lam_eff = 1 - area_cut.float() / area_orig
+    lam_eff = lam_eff.to(images.device)  # Ensure on correct device
 
     return mixed_images, labels_shuffled, lam_eff
 
