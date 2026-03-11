@@ -287,27 +287,30 @@ class VisionTransformer(nn.Module):
         matrix_params = list(self.blocks.parameters())
         resid_params = [self.resid_lambdas]
         x0_params = [self.x0_lambdas]
-        
-        assert len(list(self.parameters())) == (len(head_params) + len(patch_embed_params) + 
-            len(cls_token_params) + len(pos_embed_params) + len(matrix_params) + 
-            len(resid_params) + len(x0_params))
+        value_embed_params = [ve for ve in self.value_embeddings if ve is not None]
+
+        assert len(list(self.parameters())) == (len(head_params) + len(patch_embed_params) +
+            len(cls_token_params) + len(pos_embed_params) + len(matrix_params) +
+            len(resid_params) + len(x0_params) + len(value_embed_params))
         
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         
         param_groups = [
-            dict(kind='adamw', params=head_params, lr=unembedding_lr * dmodel_lr_scale, 
+            dict(kind='adamw', params=head_params, lr=unembedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=patch_embed_params, lr=embedding_lr * dmodel_lr_scale, 
+            dict(kind='adamw', params=patch_embed_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=cls_token_params, lr=embedding_lr * dmodel_lr_scale, 
+            dict(kind='adamw', params=cls_token_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=pos_embed_params, lr=embedding_lr * dmodel_lr_scale, 
+            dict(kind='adamw', params=pos_embed_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, 
+            dict(kind='adamw', params=value_embed_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, 
+            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01,
+                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=x0_params, lr=scalar_lr,
                  betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
         ]
         
