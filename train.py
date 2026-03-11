@@ -92,7 +92,8 @@ class CausalSelfAttention(nn.Module):
 
         # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
         if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
+            # ve is (1, T, n_head, head_dim), expand to batch size
+            ve = ve.expand(B, -1, -1, -1)
             gate_input = x[..., :self.ve_gate_channels]
             gate = 2 * torch.sigmoid(F.linear(gate_input, self.ve_gate_weight)).view(B, T, self.n_kv_head, 1)
             v = v + gate * ve
@@ -163,9 +164,10 @@ class VisionTransformer(nn.Module):
         self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, device=device))
         self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, device=device))
 
-        # Value embeddings for alternating layers (learned per-layer embeddings)
+        # Value embeddings for alternating layers (learned per-head embeddings)
+        # Shape: (1, num_tokens, n_head, head_dim) to match the multi-head structure
         self.value_embeddings = nn.ParameterList([
-            nn.Parameter(torch.zeros(1, num_tokens, config.n_embd, device=device))
+            nn.Parameter(torch.zeros(1, num_tokens, config.n_head, config.n_embd // config.n_head, device=device))
             if has_ve(i, config.n_layer) else None
             for i in range(config.n_layer)
         ])
