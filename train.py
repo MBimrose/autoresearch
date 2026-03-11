@@ -473,17 +473,17 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-DEPTH = 12              # Number of transformer layers (increased for more capacity)
+DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
 ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
-# Optimization - smaller batch for more steps
-TOTAL_BATCH_SIZE = 2**12   # ~4K patches per optimizer step
+# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
+TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam)
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
@@ -491,7 +491,11 @@ WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 64       # per-device batch size (more steps)
+DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
+
+# EMA (Exponential Moving Average) for weights - helps final accuracy
+USE_EMA = True
+EMA_DECAY = 0.995            # EMA decay factor (higher = smoother)
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
@@ -539,6 +543,17 @@ model = VisionTransformer(config, device=device)
 
 # Initialize weights
 model.init_weights()
+
+# Create EMA model (copy of model with exponential moving average weights)
+if USE_EMA:
+    import copy
+    ema_model = copy.deepcopy(model)
+    # Freeze EMA model parameters (no gradients needed)
+    for p in ema_model.parameters():
+        p.requires_grad = False
+    print("Using EMA with decay =", EMA_DECAY)
+else:
+    ema_model = None
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -651,6 +666,13 @@ while True:
             group["weight_decay"] = muon_weight_decay
     
     optimizer.step()
+
+    # Update EMA weights after optimizer step
+    if ema_model is not None:
+        with torch.no_grad():
+            for ema_param, param in zip(ema_model.parameters(), model.parameters()):
+                ema_param.mul_(EMA_DECAY).add_(param, alpha=1 - EMA_DECAY)
+
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -705,9 +727,11 @@ if val_images is None or val_labels is None:
 
 val_loader = make_val_dataloader(val_images, val_labels, DEVICE_BATCH_SIZE)
 
-model.eval()
+# Evaluate with EMA model if available, otherwise use regular model
+eval_model = ema_model if ema_model is not None else model
+eval_model.eval()
 with autocast_ctx:
-    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
+    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(eval_model, val_loader, device)
 
 
 # Final summary
