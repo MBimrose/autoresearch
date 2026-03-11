@@ -472,26 +472,26 @@ class MuonAdamW(torch.optim.Optimizer):
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture - smaller for more steps
-DEPTH = 6               # Fewer layers = faster
-ASPECT_RATIO = 64       # Smaller dimension
+# Model architecture
+DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
+ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
-# Optimization - maximize steps with tiny batch
-TOTAL_BATCH_SIZE = 2**10   # ~1K patches per optimizer step
-EMBEDDING_LR = 1.0         # Higher LR for patch embeddings
-VALUE_EMBEDDING_LR = 2.0   # Higher LR for value embeddings
-UNEMBEDDING_LR = 0.01      # Higher LR for head
-MATRIX_LR = 0.04           # Higher LR for matrix params
-SCALAR_LR = 1.0            # Higher LR for scalars
-WEIGHT_DECAY = 0.1         # Lower weight decay
-ADAM_BETAS = (0.9, 0.95)   # Adam beta1, beta2
+# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
+TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
+EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
+UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
+SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
+ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
 WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 16       # Tiny batch for maximum steps
+DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
