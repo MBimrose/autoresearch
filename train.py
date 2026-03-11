@@ -496,9 +496,9 @@ DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
 # Data augmentation
 USE_AUGMENTATION = True      # enable/disable augmentation
-MIXUP_ALPHA = 0.2            # mixup alpha (0 = no mixup)
-LABEL_SMOOTHING = 0.1        # label smoothing epsilon
-AUGMENT_SCALE = 1.0          # strength of augmentation
+MIXUP_ALPHA = 0.0            # mixup alpha (0 = no mixup, try 0.2 later)
+LABEL_SMOOTHING = 0.0        # label smoothing epsilon (try 0.1 later)
+AUGMENT_SCALE = 0.5          # strength of augmentation (reduced)
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
@@ -584,14 +584,14 @@ def augment_batch(images, labels, training=True):
     if not training or not USE_AUGMENTATION:
         return images, labels, labels, torch.ones(labels.shape[0], device=labels.device)
 
-    # Apply augmentations
+    # Apply simple flip augmentation only (most effective and stable)
     images = random_flip_lr(images)
-    images = random_crop(images, scale=0.2 * AUGMENT_SCALE)
-    images = color_jitter(images, brightness=0.2 * AUGMENT_SCALE,
-                         contrast=0.2 * AUGMENT_SCALE, saturation=0.2 * AUGMENT_SCALE)
 
-    # Apply CutMix
-    images, labels_a, labels_b, lam = cutmix(images, labels, alpha=MIXUP_ALPHA)
+    # Apply CutMix if enabled
+    if MIXUP_ALPHA > 0:
+        images, labels_a, labels_b, lam = cutmix(images, labels, alpha=MIXUP_ALPHA)
+    else:
+        labels_a, labels_b, lam = labels, labels, torch.ones(labels.shape[0], device=labels.device)
 
     return images, labels_a, labels_b, lam
 
