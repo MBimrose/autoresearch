@@ -479,7 +479,8 @@ HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
+# With PATCH_SIZE=4: num_patches=256, so DEVICE_BATCH_SIZE=64 gives 16384 tokens/fwdbwd
+TOTAL_BATCH_SIZE = 2**14   # ~16K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
 VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
@@ -491,7 +492,7 @@ WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
+DEVICE_BATCH_SIZE = 64       # per-device batch size (adjusted for 4x4 patches)
 
 # Architecture variant - try smaller patches for better spatial resolution
 PATCH_SIZE = 4               # 4x4 patches instead of 8x8 (more tokens, better for small images)
