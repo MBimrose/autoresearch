@@ -474,7 +474,7 @@ class MuonAdamW(torch.optim.Optimizer):
 
 # Model architecture
 DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
-ASPECT_RATIO = 96       # multiplier for model dimension
+ASPECT_RATIO = 128      # multiplier for model dimension (trying wider model)
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
