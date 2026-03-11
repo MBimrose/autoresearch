@@ -493,6 +493,9 @@ FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
 DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
+# Label smoothing for better generalization
+LABEL_SMOOTHING = 0.05       # mild label smoothing (0 = standard CE)
+
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
 
@@ -626,7 +629,16 @@ while True:
             labels = labels.to(device)
 
             logits = model(images_reshaped)
-            loss = F.cross_entropy(logits, labels)
+
+            # Apply label smoothing if configured
+            if LABEL_SMOOTHING > 0:
+                num_classes = logits.shape[-1]
+                log_probs = F.log_softmax(logits, dim=-1)
+                smooth_targets = torch.zeros_like(log_probs).scatter(-1, labels.unsqueeze(-1), 1.0)
+                smooth_targets = smooth_targets * (1 - LABEL_SMOOTHING) + (1 - smooth_targets) * (LABEL_SMOOTHING / (num_classes - 1))
+                loss = -(smooth_targets * log_probs).sum(dim=-1).mean()
+            else:
+                loss = F.cross_entropy(logits, labels)
         
         train_loss = loss.detach()
         loss = loss / grad_accum_steps
