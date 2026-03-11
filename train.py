@@ -58,9 +58,8 @@ def norm(x):
 
 
 def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding."""
-    # ABLATION: all layers get value embeddings (not just alternating)
-    return True  # was: layer_idx % 2 == (n_layer - 1) % 2
+    """Returns True if layer should have Value Embedding (alternating, last always included)."""
+    return layer_idx % 2 == (n_layer - 1) % 2
 
 
 class CausalSelfAttention(nn.Module):
@@ -278,10 +277,12 @@ class VisionTransformer(nn.Module):
         
         return 6 * nparams + attn_flops
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
+    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, value_embedding_lr=None,
+                        matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
-        
+        if value_embedding_lr is None:
+            value_embedding_lr = embedding_lr
+
         # Parameter groups by type
         head_params = [self.head_weight]
         patch_embed_params = [self.patch_embed_weight]
@@ -295,11 +296,11 @@ class VisionTransformer(nn.Module):
         assert len(list(self.parameters())) == (len(head_params) + len(patch_embed_params) +
             len(cls_token_params) + len(pos_embed_params) + len(matrix_params) +
             len(resid_params) + len(x0_params) + len(value_embed_params))
-        
+
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        
+
         param_groups = [
             dict(kind='adamw', params=head_params, lr=unembedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -309,7 +310,7 @@ class VisionTransformer(nn.Module):
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=pos_embed_params, lr=embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embed_params, lr=embedding_lr * dmodel_lr_scale,
+            dict(kind='adamw', params=value_embed_params, lr=value_embedding_lr * dmodel_lr_scale,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01,
                  betas=adam_betas, eps=1e-10, weight_decay=0.0),
@@ -480,6 +481,7 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not us
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
 TOTAL_BATCH_SIZE = 2**16   # ~64K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
+VALUE_EMBEDDING_LR = 0.6   # learning rate for value embeddings (Adam) - try higher LR
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
 MATRIX_LR = 0.04           # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
@@ -554,6 +556,7 @@ grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
 optimizer = model.setup_optimizer(
     unembedding_lr=UNEMBEDDING_LR,
     embedding_lr=EMBEDDING_LR,
+    value_embedding_lr=VALUE_EMBEDDING_LR,
     scalar_lr=SCALAR_LR,
     adam_betas=ADAM_BETAS,
     matrix_lr=MATRIX_LR,
