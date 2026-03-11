@@ -479,7 +479,7 @@ HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (keeping ratio)
+TOTAL_BATCH_SIZE = 24576   # 4x tokens_per_fwdbwd (6144 * 4 = 24576)
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
 VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
