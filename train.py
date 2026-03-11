@@ -481,7 +481,7 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not us
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
 TOTAL_BATCH_SIZE = 2**16   # ~64K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 0.6   # learning rate for value embeddings (Adam) - try higher LR
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
 MATRIX_LR = 0.04           # learning rate for matrix parameters (Muon)
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
