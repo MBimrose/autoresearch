@@ -5,7 +5,7 @@ Vision Transformer variant of nanochat autoresearch.
 Usage: uv run train_vision.py
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 only
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 only
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -172,9 +172,6 @@ class VisionTransformer(nn.Module):
             for i in range(config.n_layer)
         ])
 
-        # Stochastic depth rate
-        self.drop_rate = 0.1  # Will be set from global STOCHASTIC_DEPTH_RATE
-
     def init_weights(self):
         # Patch embedding init
         torch.nn.init.normal_(self.patch_embed_weight, mean=0.0, std=0.02)
@@ -238,23 +235,11 @@ class VisionTransformer(nn.Module):
         x = x + self.pos_embed.to(device=x.device, dtype=x.dtype)
         
         # Apply transformer blocks with residual connections and value embeddings
-        # Stochastic depth: linearly increasing drop rate from 0 to drop_rate
         x0 = x
-        training = self.training
         for i, block in enumerate(self.blocks):
             x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
             ve = self.value_embeddings[i] if self.value_embeddings[i] is not None else None
-            # Stochastic depth during training
-            if training and hasattr(self, 'drop_rate'):
-                drop_prob = (i / (len(self.blocks) - 1)) * self.drop_rate if len(self.blocks) > 1 else 0
-                keep_prob = 1 - drop_prob
-                if torch.rand(1, device=x.device) < keep_prob:
-                    x = block(x, ve)
-                else:
-                    # Skip the block, but keep residual connection
-                    pass
-            else:
-                x = block(x, ve)
+            x = block(x, ve)
         
         # Mean pooling over all patches (simple and effective for ViT)
         x = x.mean(dim=1)
@@ -488,34 +473,91 @@ class MuonAdamW(torch.optim.Optimizer):
 # ---------------------------------------------------------------------------
 
 # Model architecture
-DEPTH = 10              # Number of transformer layers (increased from 8 for more capacity)
-ASPECT_RATIO = 128      # multiplier for model dimension (increased from 96 for wider model)
+DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
+ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**12   # ~4K patches per optimizer step (smaller batch for more updates)
-EMBEDDING_LR = 0.4         # learning rate for patch embeddings (Adam) - scaled for wider model
-VALUE_EMBEDDING_LR = 0.8   # learning rate for value embeddings (Adam) - scaled
-UNEMBEDDING_LR = 0.003     # learning rate for head (Adam) - scaled
-MATRIX_LR = 0.015          # learning rate for matrix parameters (Muon) - scaled for wider model
-SCALAR_LR = 0.3            # learning rate for per-layer scalars (Adam) - scaled
-WEIGHT_DECAY = 0.15        # weight decay for Muon - slightly lower
+TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
+EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
+UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
+MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
+SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
+WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.05        # small warmup to stabilize training
-WARMDOWN_RATIO = 0.3       # cosine-like warmdown
+WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
+WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
-DEVICE_BATCH_SIZE = 64       # per-device batch size (smaller for more gradient updates)
+DEVICE_BATCH_SIZE = 128      # per-device batch size (max steps)
 
-# Stochastic depth (layer dropout)
-STOCHASTIC_DEPTH_RATE = 0.1  # probability of dropping a layer (increases linearly with depth)
+# EMA (Exponential Moving Average) for evaluation
+USE_EMA = True             # maintain EMA of weights for final evaluation
+EMA_DECAY = 0.999          # EMA decay rate (higher = more smoothing)
+
+# Data augmentation - stronger pipeline
+USE_AUGMENTATION = True    # enable augmentation
+AUGMENT_SCALE = 0.15       # random crop scale (0.15 = crop 85-100% of image)
+COLOR_JITTER = True        # enable color jitter
+FLIP_PROB = 0.5            # horizontal flip probability
 
 # Safety thresholds
 LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
 
 # Training termination (set NUM_EPOCHS>0 to use epoch-based stopping)
 NUM_EPOCHS = 5
+
+
+# ---------------------------------------------------------------------------
+# Data augmentation functions
+# ---------------------------------------------------------------------------
+
+def random_flip_lr(images, prob=0.5):
+    """Random horizontal flip."""
+    mask = torch.rand(images.shape[0], 1, 1, 1, device=images.device) < prob
+    return images.flip(-1).mul(mask) + images.mul(~mask)
+
+
+def random_crop(images, scale=0.15):
+    """Random resized crop using interpolation."""
+    B, C, H, W = images.shape
+    output = torch.empty_like(images)
+    for i in range(B):
+        new_size = int(H * (1 - scale * torch.rand(1).item()))
+        new_size = max(new_size, 8)
+        h = torch.randint(0, H - new_size + 1, (1,)).item()
+        w = torch.randint(0, W - new_size + 1, (1,)).item()
+        cropped = images[i:i+1, :, h:h+new_size, w:w+new_size]
+        output[i] = F.interpolate(cropped, size=(H, W), mode='bilinear', align_corners=False)[0]
+    return output
+
+
+def color_jitter(images, brightness=0.2, contrast=0.2, saturation=0.2):
+    """Random color jitter."""
+    B, C, H, W = images.shape
+    output = images.clone()
+    for i in range(B):
+        if torch.rand(1) < 0.5:
+            factor = 0.5 + torch.rand(1).item() * brightness
+            output[i] = output[i].clamp(0, 1) * factor
+        if torch.rand(1) < 0.5:
+            factor = 0.8 + torch.rand(1).item() * contrast
+            mean = output[i].mean(dim=(1, 2), keepdim=True)
+            output[i] = (output[i] - mean) * factor + mean
+    return output.clamp(0, 1)
+
+
+def augment_batch(images, training=True):
+    """Apply augmentation to a batch of images."""
+    if not training or not USE_AUGMENTATION:
+        return images
+    images = random_crop(images, scale=AUGMENT_SCALE)
+    if COLOR_JITTER:
+        images = color_jitter(images)
+    images = random_flip_lr(images, prob=FLIP_PROB)
+    return images
 
 
 # ---------------------------------------------------------------------------
@@ -558,8 +600,16 @@ model = VisionTransformer(config, device=device)
 # Initialize weights
 model.init_weights()
 
-# Set stochastic depth rate from global constant
-model.drop_rate = STOCHASTIC_DEPTH_RATE
+# Initialize EMA model if enabled
+if USE_EMA:
+    print(f"Initializing EMA with decay={EMA_DECAY}...")
+    model_ema = VisionTransformer(config, device=device)
+    with torch.no_grad():
+        for ema_param, param in zip(model_ema.parameters(), model.parameters()):
+            ema_param.data.copy_(param.data)
+    model_ema.eval()
+else:
+    model_ema = None
 
 param_counts = model.num_scaling_params()
 print("Parameter counts:")
@@ -642,11 +692,12 @@ while True:
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
             # Images are already in (B, C, H, W) format from dataloader
-            images_reshaped = images
+            # Apply augmentation
+            images_aug = augment_batch(images, training=True)
             # Move labels to the training device
             labels = labels.to(device)
 
-            logits = model(images_reshaped)
+            logits = model(images_aug)
             loss = F.cross_entropy(logits, labels)
         
         train_loss = loss.detach()
@@ -672,6 +723,13 @@ while True:
             group["weight_decay"] = muon_weight_decay
     
     optimizer.step()
+
+    # Update EMA after optimizer step
+    if USE_EMA and model_ema is not None:
+        with torch.no_grad():
+            for ema_param, param in zip(model_ema.parameters(), model.parameters()):
+                ema_param.mul_(EMA_DECAY).add_(param, alpha=1 - EMA_DECAY)
+
     model.zero_grad(set_to_none=True)
 
     train_loss_f = train_loss.item()
@@ -726,9 +784,11 @@ if val_images is None or val_labels is None:
 
 val_loader = make_val_dataloader(val_images, val_labels, DEVICE_BATCH_SIZE)
 
-model.eval()
+# Evaluate with EMA model if enabled, otherwise use main model
+eval_model = model_ema if USE_EMA and model_ema is not None else model
+eval_model.eval()
 with autocast_ctx:
-    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
+    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(eval_model, val_loader, device)
 
 
 # Final summary
