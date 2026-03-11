@@ -59,7 +59,9 @@ def norm(x):
 
 def has_ve(layer_idx, n_layer):
     """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
+    # ABLATION: return False to disable value embeddings
+    # return layer_idx % 2 == (n_layer - 1) % 2  # original
+    return False  # ABLATION: no value embeddings
 
 
 class CausalSelfAttention(nn.Module):
