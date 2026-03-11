@@ -5,6 +5,7 @@ Vision Transformer variant of nanochat autoresearch.
 Usage: uv run train_vision.py
 """
 import os
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"  # Use GPU 1 only
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
