@@ -480,14 +480,14 @@ WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not us
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
 TOTAL_BATCH_SIZE = 2**13   # ~8K patches per optimizer step (smallest)
-EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
+EMBEDDING_LR = 0.1         # learning rate for patch embeddings (Adam) - reduced
+VALUE_EMBEDDING_LR = 0.2   # learning rate for value embeddings (Adam) - reduced
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.02           # learning rate for matrix parameters (Muon) - trying lower
-SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
+MATRIX_LR = 0.005          # learning rate for matrix parameters (Muon) - reduced
+SCALAR_LR = 0.1            # learning rate for per-layer scalars (Adam) - reduced
+WEIGHT_DECAY = 0.1         # cautious weight decay for Muon - reduced
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
+WARMUP_RATIO = 0.05        # fraction of time budget for LR warmup - added warmup
 WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
 FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
 
