@@ -322,7 +322,7 @@ torch.manual_seed(42)
 torch.cuda.manual_seed(42)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float32)
 RTX_6000_ADA_BF16_PEAK_FLOPS = 362.5e12
 
 # Load data
