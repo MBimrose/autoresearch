@@ -474,16 +474,16 @@ class MuonAdamW(torch.optim.Optimizer):
 
 # Model architecture
 DEPTH = 8               # Number of transformer layers (increased from 4 to use more VRAM)
-ASPECT_RATIO = 128      # multiplier for model dimension (trying wider model)
+ASPECT_RATIO = 96       # multiplier for model dimension
 HEAD_DIM = 128          # attention head dimension
 WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
 
 # Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
 TOTAL_BATCH_SIZE = 2**16   # ~64K patches per optimizer step
 EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-VALUE_EMBEDDING_LR = 2.0   # learning rate for value embeddings (Adam) - trying even higher
+VALUE_EMBEDDING_LR = 1.2   # learning rate for value embeddings (Adam) - trying 2x higher
 UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.04           # learning rate for matrix parameters (Muon)
+MATRIX_LR = 0.06           # learning rate for matrix parameters (Muon) - trying higher
 SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
 WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
 ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
