@@ -84,13 +84,13 @@ class ResNet(nn.Module):
         super().__init__()
         self.config = config
 
-        # Initial conv layer
-        self.conv1 = nn.Conv2d(3, config.base_channels, 3, stride=1,
-                               padding=1, bias=False, device=device)
-
         # Stages
         channels = [config.base_channels * (2**i) * config.width_multiplier
                     for i in range(4)]
+
+        # Initial conv layer - outputs channels[0]
+        self.conv1 = nn.Conv2d(3, channels[0], 3, stride=1,
+                               padding=1, bias=False, device=device)
 
         # conv1 outputs channels[0], so stage1 takes channels[0] as input
         self.stage1 = Stage(channels[0], channels[0], config.block_depth, stride=1, device=device)
