@@ -140,9 +140,9 @@ BASE_CHANNELS = 64             # Base channel width
 NUM_CLASSES = 200              # TinyImageNet classes
 
 # Optimization - SGD with momentum (standard for ResNets)
-TOTAL_BATCH_SIZE = 256         # Smaller batch = more steps
-DEVICE_BATCH_SIZE = 128        # Per-device batch size
-LR = 0.15                      # Lower LR for smaller batch
+TOTAL_BATCH_SIZE = 128         # Even smaller batch = even more steps
+DEVICE_BATCH_SIZE = 64         # Per-device batch size
+LR = 0.1                       # Lower LR for smaller batch
 MOMENTUM = 0.9                 # SGD momentum
 WEIGHT_DECAY = 5e-4            # Standard weight decay
 WARMDOWN_RATIO = 0.15          # Fraction of time for LR warmdown
