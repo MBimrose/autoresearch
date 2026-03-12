@@ -5,7 +5,7 @@ ResNet-18 for TinyImageNet - CNN architecture for sample efficiency.
 Usage: uv run train.py
 """
 import os
-os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0 for this experiment
+os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # Use GPU 0
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
@@ -22,35 +22,6 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 # ResNet-18 Model (CNN - more sample efficient than ViT)
 # ---------------------------------------------------------------------------
-
-class BottleneckBlock(nn.Module):
-    """ResNet bottleneck block: 1x1 -> 3x3 -> 1x1 with expansion=4."""
-    expansion = 4
-
-    def __init__(self, in_channels, out_channels, stride=1, device="cuda"):
-        super().__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 1, stride=1, bias=False, device=device)
-        self.bn1 = nn.BatchNorm2d(out_channels, device=device)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, 3, stride=stride, padding=1, bias=False, device=device)
-        self.bn2 = nn.BatchNorm2d(out_channels, device=device)
-        self.conv3 = nn.Conv2d(out_channels, out_channels * self.expansion, 1, stride=1, bias=False, device=device)
-        self.bn3 = nn.BatchNorm2d(out_channels * self.expansion, device=device)
-
-        self.shortcut = nn.Identity()
-        if stride != 1 or in_channels != out_channels * self.expansion:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels * self.expansion, 1, stride=stride, bias=False, device=device),
-                nn.BatchNorm2d(out_channels * self.expansion, device=device)
-            )
-
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = F.relu(self.bn2(self.conv2(out)))
-        out = self.bn3(self.conv3(out))
-        out = out + self.shortcut(x)
-        out = F.relu(out)
-        return out
-
 
 class BasicBlock(nn.Module):
     """ResNet basic block with skip connection."""
@@ -96,8 +67,7 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, base_channels * 4, num_blocks[2], stride=2, device=device)
         self.layer4 = self._make_layer(block, base_channels * 8, num_blocks[3], stride=2, device=device)
 
-        # Classification head - store block expansion for later use
-        self.block_expansion = block.expansion
+        # Classification head
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(base_channels * 8 * block.expansion, num_classes, bias=False, device=device)
 
@@ -106,7 +76,7 @@ class ResNet(nn.Module):
         layers = []
         for stride in strides:
             layers.append(block(self.in_channels, channels, stride, device))
-            self.in_channels = channels * block.expansion
+            self.in_channels = channels
         return nn.Sequential(*layers)
 
     def forward(self, x):
@@ -147,9 +117,9 @@ class ResNet(nn.Module):
         # FC: 512*200 = 0.1M
         return 35e6  # ~35M FLOPs per forward pass
 
-    def setup_optimizer(self, lr=0.1, momentum=0.9, weight_decay=5e-4):
-        optimizer = torch.optim.SGD(self.parameters(), lr=lr, momentum=momentum,
-                                    weight_decay=weight_decay, nesterov=True)
+    def setup_optimizer(self, lr=0.001, beta1=0.9, beta2=0.999, weight_decay=0.05):
+        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=(beta1, beta2),
+                                      weight_decay=weight_decay)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -164,18 +134,19 @@ ViTConfig = None
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture: ResNet-50 (bottleneck blocks, deeper network)
-RESNET_BLOCKS = [3, 4, 6, 3]   # ResNet-50 configuration
-BASE_CHANNELS = 64             # Base channel width (64 -> 256 in layer1)
+# Model architecture: ResNet-18 (2,2,2,2 blocks per layer)
+RESNET_BLOCKS = [2, 2, 2, 2]  # ResNet-18 configuration [2,2,2,2]=18, [3,4,6,3]=34
+BASE_CHANNELS = 64             # Base channel width
 NUM_CLASSES = 200              # TinyImageNet classes
 
-# Optimization - SGD with momentum (standard for ResNets)
+# Optimization - AdamW (often converges faster than SGD)
 TOTAL_BATCH_SIZE = 64          # Batch size
 DEVICE_BATCH_SIZE = 32         # Per-device batch size
-LR = 0.05                      # Lower LR for deeper network
-MOMENTUM = 0.9                 # Standard momentum
-WEIGHT_DECAY = 5e-4            # Standard weight decay for ResNet
-WARMDOWN_RATIO = 0.2           # Longer warmdown
+LR = 0.001                     # AdamW learning rate
+BETA1 = 0.9                    # Adam beta1
+BETA2 = 0.999                  # Adam beta2
+WEIGHT_DECAY = 0.05            # AdamW weight decay (decoupled)
+WARMDOWN_RATIO = 0.1           # Fraction of time for LR warmdown
 FINAL_LR_FRAC = 0.0            # Final LR as fraction of initial
 
 # Safety thresholds
@@ -207,17 +178,8 @@ train_images = train_images.float()
 train_labels = train_labels.long()
 val_images, val_labels = None, None  # Will load later for evaluation
 
-# Create ResNet model - use BottleneckBlock for ResNet-50+ (expansion=4), BasicBlock for ResNet-18/34
-if RESNET_BLOCKS == [2, 2, 2, 2]:
-    # ResNet-18 uses BasicBlock (expansion=1)
-    block_type = BasicBlock
-    print("Using ResNet-18 architecture (BasicBlock)")
-else:
-    # ResNet-50+ uses BottleneckBlock (expansion=4)
-    block_type = BottleneckBlock
-    print("Using ResNet-50 architecture (BottleneckBlock)")
-
-model = ResNet(block_type, RESNET_BLOCKS, num_classes=NUM_CLASSES, base_channels=BASE_CHANNELS, device=device)
+# Create ResNet-18 model
+model = ResNet(BasicBlock, RESNET_BLOCKS, num_classes=NUM_CLASSES, base_channels=BASE_CHANNELS, device=device)
 
 # Initialize weights
 model.init_weights()
@@ -233,7 +195,7 @@ print(f"Estimated FLOPs per forward pass: {num_flops_per_token:e}")
 # Calculate gradient accumulation steps
 grad_accum_steps = TOTAL_BATCH_SIZE // DEVICE_BATCH_SIZE
 
-optimizer = model.setup_optimizer(lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+optimizer = model.setup_optimizer(lr=LR, beta1=BETA1, beta2=BETA2, weight_decay=WEIGHT_DECAY)
 
 # Create dataloaders
 train_loader = make_dataloader(train_images, train_labels, DEVICE_BATCH_SIZE, shuffle=True)
