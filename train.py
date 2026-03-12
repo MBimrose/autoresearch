@@ -1,14 +1,13 @@
 """
-Autoresearch vision pretraining script. Single-GPU, single-file.
-Vision Transformer variant of nanochat autoresearch.
+Autoresearch vision pretraining with DPS patch selection.
+Single-GPU, single-file implementation for AIMS cellphone fingerprint dataset.
 
-Usage: uv run train_vision.py
+Usage: uv run train.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
-import gc
 import time
 import math
 from dataclasses import dataclass, asdict
@@ -16,693 +15,699 @@ from dataclasses import dataclass, asdict
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torchvision import transforms
+from torchvision.models import resnet18
 
-from kernels import get_kernel
-cap = torch.cuda.get_device_capability()
-# varunneal's FA3 is Hopper only, use kernels-community on non-Hopper GPUs
-repo = "varunneal/flash-attention-3" if cap == (9, 0) else "kernels-community/flash-attn3"
+from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts, create_cached_dataset, create_val_dataset, make_val_dataloader
 
-# Try to load flash attention kernel, fallback to PyTorch's native FA2
-try:
-    fa_kernel = get_kernel(repo).flash_attn_interface
-    # Check if the expected function exists
-    if hasattr(fa_kernel, 'flash_attn_func'):
-        fa3 = fa_kernel.flash_attn_func
-    else:
-        print("Flash attention kernel loaded but missing flash_attn_func, using PyTorch FA2")
-        fa3 = None
-except Exception as e:
-    print(f"Failed to load flash attention kernel: {e}, using PyTorch FA2")
-    fa3 = None
-
-from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts
 
 # ---------------------------------------------------------------------------
-# Vision Transformer Model
+# DPS (Differentiable Patch Selection) Module
 # ---------------------------------------------------------------------------
 
-@dataclass
-class ViTConfig:
-    image_size: int = 64
-    patch_size: int = 8
-    num_classes: int = 200
-    n_layer: int = 12
-    n_head: int = 8
-    n_embd: int = 768
-    window_pattern: str = "SSSL"
+class PerturbedTopK(nn.Module):
+    """Differentiable Top-K relaxation using perturbation-based gradients."""
 
-
-def norm(x):
-    return F.rms_norm(x, (x.size(-1),))
-
-
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
-
-
-class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx, device="cuda"):
+    def __init__(self, k: int, num_samples: int = 500, sigma: float = 0.05):
         super().__init__()
-        self.n_head = config.n_head
-        self.n_kv_head = config.n_head  # No KV caching for ViT (non-causal) - back to standard attention
-        self.n_embd = config.n_embd
-        self.head_dim = self.n_embd // self.n_head
-        assert self.n_embd % self.n_head == 0
-        
-        self.c_q_weight = nn.Parameter(torch.empty(config.n_head * self.head_dim, config.n_embd, device=device))
-        self.c_k_weight = nn.Parameter(torch.empty(self.n_kv_head * self.head_dim, config.n_embd, device=device))
-        self.c_v_weight = nn.Parameter(torch.empty(self.n_kv_head * self.head_dim, config.n_embd, device=device))
-        self.c_proj_weight = nn.Parameter(torch.empty(config.n_embd, config.n_embd, device=device))
-        
-        # Value embeddings for alternating layers
-        self.ve_gate_channels = 32
-        if has_ve(layer_idx, config.n_layer):
-            self.ve_gate_weight = nn.Parameter(torch.empty(self.n_kv_head, self.ve_gate_channels, device=device))
-        else:
-            self.ve_gate_weight = None
-
-    def forward(self, x, ve):
-        B, T, C = x.size()
-        
-        q = F.linear(x, self.c_q_weight).view(B, T, self.n_head, self.head_dim)
-        k = F.linear(x, self.c_k_weight).view(B, T, self.n_kv_head, self.head_dim)
-        v = F.linear(x, self.c_v_weight).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate_input = x[..., :self.ve_gate_channels]
-            gate = 2 * torch.sigmoid(F.linear(gate_input, self.ve_gate_weight)).view(B, T, self.n_kv_head, 1)
-            v = v + gate * ve
-
-        # Non-causal attention (bidirectional - all patches attend to all others)
-        q, k = norm(q), norm(k)
-        
-        if fa3 is not None:
-            y = fa3(q, k, v, causal=False)  # No causal masking for ViT
-        else:
-            # Use PyTorch's native flash attention (FA2)
-            y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=False)
-            y = y.transpose(1, 2).contiguous()
-        y = y.contiguous().view(B, T, -1)
-        y = F.linear(y, self.c_proj_weight)
-        return y
-
-
-class MLP(nn.Module):
-    def __init__(self, config, device="cuda"):
-        super().__init__()
-        self.c_fc_weight = nn.Parameter(torch.empty(4 * config.n_embd, config.n_embd, device=device))
-        self.c_proj_weight = nn.Parameter(torch.empty(config.n_embd, 4 * config.n_embd, device=device))
+        self.num_samples = num_samples
+        self.sigma = sigma
+        self.k = k
 
     def forward(self, x):
-        x = F.linear(x, self.c_fc_weight)
-        x = F.relu(x).square()
-        x = F.linear(x, self.c_proj_weight)
-        return x
+        return PerturbedTopKFunction.apply(x, self.k, self.num_samples, self.sigma)
 
 
-class Block(nn.Module):
-    def __init__(self, config, layer_idx, device="cuda"):
+class PerturbedTopKFunction(torch.autograd.Function):
+
+    @staticmethod
+    def forward(ctx, x, k: int, num_samples: int = 500, sigma: float = 0.05):
+        b, d = x.shape
+
+        noise = torch.normal(mean=0.0, std=1.0, size=(b, num_samples, d)).to(x.device)
+        perturbed_x = x[:, None, :] + noise * sigma
+
+        topk_results = torch.topk(perturbed_x, k=k, dim=-1, sorted=False)
+        indices = topk_results.indices
+        indices = torch.sort(indices, dim=-1).values
+
+        perturbed_output = torch.nn.functional.one_hot(indices, num_classes=d).float()
+        indicators = perturbed_output.mean(dim=1)
+
+        ctx.k = k
+        ctx.num_samples = num_samples
+        ctx.sigma = sigma
+        ctx.perturbed_output = perturbed_output
+        ctx.noise = noise
+
+        return indicators
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        if grad_output is None:
+            return tuple([None] * 5)
+
+        noise_gradient = ctx.noise
+        expected_gradient = (
+            torch.einsum("bnkd,bne->bkde", ctx.perturbed_output, noise_gradient)
+            / ctx.num_samples
+            / ctx.sigma
+        ) * float(ctx.k)
+
+        grad_input = torch.einsum("bkd,bkde->be", grad_output, expected_gradient)
+
+        return (grad_input,) + tuple([None] * 5)
+
+
+class Scorer(nn.Module):
+    """Score network for patch importance - ResNet18 based."""
+
+    def __init__(self, n_channels=3):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx, device=device)
-        self.mlp = MLP(config, device=device)
 
-    def forward(self, x, ve):
-        x = x + self.attn(norm(x), ve)
-        x = x + self.mlp(norm(x))
+        resnet = resnet18(weights="IMAGENET1K_V1")
+
+        self.scorer = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            nn.Conv2d(128, 1, kernel_size=3, padding=0),
+            nn.MaxPool2d(kernel_size=(2, 2), stride=(2, 2))
+        )
+        del resnet
+
+    def forward(self, x):
+        x = self.scorer(x)
+        return x.squeeze(1)
+
+
+class DPS(nn.Module):
+    """Differentiable Patch Selection - extracts k patches from high-res images."""
+
+    def __init__(self, n_channels, high_size, low_size, score_size, k, num_samples, sigma, patch_size, device):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.k = k
+        self.device = device
+
+        self.scorer = Scorer(n_channels).to(device)
+        self.TOPK = PerturbedTopK(k, num_samples, sigma)
+
+        h, w = high_size
+        self.h_score, self.w_score = score_size
+
+        self.scale_h = None  # Computed dynamically in forward
+        self.scale_w = None
+        self.padding = None
+        self.downscale_transform = transforms.Resize(low_size)
+
+    def forward(self, x_high):
+        b, c = x_high.shape[:2]
+        patch_size = self.patch_size
+        device = self.device
+
+        x_low = self.downscale_transform(x_high).to(device)
+
+        # Score patches
+        scores_2d = self.scorer(x_low)
+
+        # Handle both 3D (B, H, W) and 4D (B, C, H, W) outputs
+        if scores_2d.dim() == 3:
+            scores_2d = scores_2d.unsqueeze(1)  # Add channel dim
+
+        # Dynamically compute score dimensions
+        _, _, h_score, w_score = scores_2d.shape
+        self.h_score, self.w_score = h_score, w_score
+
+        # Compute scale factors and padding dynamically
+        h, w = x_high.shape[2], x_high.shape[3]
+        self.scale_h = h // self.h_score
+        self.scale_w = w // self.w_score
+        padded_h = self.scale_h * self.h_score + patch_size - 1
+        padded_w = self.scale_w * self.w_score + patch_size - 1
+        top_pad = (patch_size - self.scale_h) // 2
+        left_pad = (patch_size - self.scale_w) // 2
+        bottom_pad = padded_h - top_pad - h
+        right_pad = padded_w - left_pad - w
+        self.padding = (left_pad, right_pad, top_pad, bottom_pad)
+
+        scores_1d = scores_2d.view(b, -1)
+
+        # Normalize scores to [0, 1]
+        scores_min = scores_1d.min(dim=-1, keepdim=True)[0]
+        scores_max = scores_1d.max(dim=-1, keepdim=True)[0]
+        scores_1d = (scores_1d - scores_min) / (scores_max - scores_min + 1e-5)
+
+        # Get soft indicators via differentiable Top-K
+        indicators = self.TOPK(scores_1d).view(b, self.k, self.h_score, self.w_score)
+        self.indicators = indicators
+
+        # Extract patches with weighted combination
+        x_high_pad = torch.nn.functional.pad(x_high, self.padding, "constant", 0)
+        patches = torch.zeros((b, self.k, c, patch_size, patch_size), device=device)
+
+        for i in range(self.h_score):
+            for j in range(self.w_score):
+                start_h = i * self.scale_h
+                start_w = j * self.scale_w
+
+                current_patches = x_high_pad[:, :, start_h:start_h + patch_size, start_w:start_w + patch_size]
+                weight = indicators[:, :, i, j]
+                patches += torch.einsum('bchw,bk->bkchw', current_patches, weight)
+
+        return patches.view(-1, c, patch_size, patch_size), indicators
+
+
+# ---------------------------------------------------------------------------
+# ViT-style Feature Extractor with Cross-Attention Pooling
+# ---------------------------------------------------------------------------
+
+class ScaledDotProductAttention(nn.Module):
+    """Standard scaled dot-product attention."""
+
+    def __init__(self, temperature, attn_dropout=0.1):
+        super().__init__()
+        self.temperature = temperature
+        self.dropout = nn.Dropout(attn_dropout)
+
+    def forward(self, q, k, v):
+        attn = torch.matmul(q / self.temperature, k.transpose(2, 3))
+        attn = self.dropout(torch.softmax(attn, dim=-1))
+        output = torch.matmul(attn, v)
+        return output
+
+
+class MultiHeadCrossAttention(nn.Module):
+    """Cross-attention with learned queries for patch aggregation."""
+
+    def __init__(self, n_token, n_head, d_model, d_k, d_v, attn_dropout=0.1, dropout=0.1):
+        super().__init__()
+        self.n_token = n_token
+        self.n_head = n_head
+        self.d_k = d_k
+        self.d_v = d_v
+
+        # Learnable query tokens
+        self.q = nn.Parameter(torch.empty((1, n_token, d_model)))
+        q_init_val = math.sqrt(1 / d_k)
+        nn.init.uniform_(self.q, a=-q_init_val, b=q_init_val)
+
+        self.w_qs = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_ks = nn.Linear(d_model, n_head * d_k, bias=False)
+        self.w_vs = nn.Linear(d_model, n_head * d_v, bias=False)
+        self.fc = nn.Linear(n_head * d_v, d_model, bias=False)
+
+        self.attention = ScaledDotProductAttention(temperature=d_k ** 0.5, attn_dropout=attn_dropout)
+        self.dropout = nn.Dropout(dropout)
+        self.layer_norm = nn.LayerNorm(d_model, eps=1e-6)
+
+    def forward(self, x):
+        d_k, d_v, n_head = self.d_k, self.d_v, self.n_head
+        n_token = self.n_token
+        b, len_seq = x.shape[:2]
+
+        q = self.w_qs(self.q).view(1, n_token, n_head, d_k)
+        k = self.w_ks(x).view(b, len_seq, n_head, d_k)
+        v = self.w_vs(x).view(b, len_seq, n_head, d_v)
+
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+
+        x = self.attention(q, k, v)
+        x = x.transpose(1, 2).contiguous().view(b, n_token, -1)
+        x = self.dropout(self.fc(x))
+        x += self.q
+        x = self.layer_norm(x)
         return x
 
 
-class VisionTransformer(nn.Module):
+class PositionwiseFeedForward(nn.Module):
+    """Position-wise feed-forward network with residual connection."""
+
+    def __init__(self, d_in, d_hid, dropout=0.1):
+        super().__init__()
+        self.w_1 = nn.Linear(d_in, d_hid)
+        self.w_2 = nn.Linear(d_hid, d_in)
+        self.layer_norm = nn.LayerNorm(d_in, eps=1e-6)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        residual = x
+        x = self.w_2(torch.relu(self.w_1(x)))
+        x = self.dropout(x)
+        x += residual
+        x = self.layer_norm(x)
+        return x
+
+
+class EncoderLayer(nn.Module):
+    """Transformer encoder layer with cross-attention."""
+
+    def __init__(self, n_token, d_model, d_inner, n_head, d_k, d_v, attn_dropout=0.1, dropout=0.1):
+        super().__init__()
+        self.n_token = n_token
+        self.crs_attn = MultiHeadCrossAttention(n_token, n_head, d_model, d_k, d_v, attn_dropout=attn_dropout, dropout=dropout)
+        self.pos_ffn = PositionwiseFeedForward(d_model, d_inner, dropout=dropout)
+
+    def forward(self, x):
+        x = self.crs_attn(x)
+        x = self.pos_ffn(x)
+        return x
+
+
+class Transformer(nn.Module):
+    """Stack of transformer encoder layers."""
+
+    def __init__(self, n_layer, n_token, n_head, d_k, d_v, d_model, d_inner, attn_dropout=0.1, dropout=0.1):
+        super().__init__()
+        self.layer_stack = nn.ModuleList([
+            EncoderLayer(n_token[i], d_model, d_inner, n_head, d_k, d_v, attn_dropout=attn_dropout, dropout=dropout)
+            for i in range(n_layer)
+        ])
+
+    def forward(self, x):
+        for enc_layer in self.layer_stack:
+            x = enc_layer(x)
+        return x
+
+
+class PatchAggregator(nn.Module):
+    """ViT-style patch aggregator with cross-attention pooling.
+
+    Takes k patch features from DPS and aggregates them into a single representation
+    using learned query tokens and cross-attention.
+    """
+
+    def __init__(self, input_dim, num_classes, n_layer=2, n_token=1, n_head=8,
+                 d_k=64, d_v=64, d_model=512, d_inner=2048, attn_dropout=0.1, dropout=0.1,
+                 num_patches=5):
+        super().__init__()
+
+        self.input_dim = input_dim
+        self.n_token = n_token
+        self.n_layer = n_layer
+        self.num_patches = num_patches  # k value from DPS
+
+        # Project patch features to model dimension
+        self.embedding = nn.Linear(input_dim, d_model)
+
+        # Position encoding for patch sequence (k patches)
+        self.pos_encoder = nn.Parameter(torch.zeros(1, num_patches, d_model))
+
+        # Transformer layers
+        self.transformer = Transformer(
+            n_layer,
+            n_token=(n_token,) * n_layer,
+            n_head=n_head,
+            d_k=d_k,
+            d_v=d_v,
+            d_model=d_model,
+            d_inner=d_inner,
+            attn_dropout=attn_dropout,
+            dropout=dropout
+        )
+
+        # Classification head
+        self.fc = nn.Linear(d_model, num_classes)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Patch features of shape (batch * k, input_dim)
+        Returns:
+            Logits of shape (batch, num_classes)
+        """
+        # Reshape to (batch, k, input_dim) - k is num_patches
+        batch_size = x.shape[0] // self.num_patches
+        x = x.view(batch_size, self.num_patches, self.input_dim)
+
+        # Project to model dimension
+        x = self.embedding(x)
+
+        # Add positional encoding
+        x = x + self.pos_encoder
+
+        # Transform
+        x = self.transformer(x)
+
+        # Mean pooling over tokens
+        x = x.mean(dim=1)
+
+        # Classify
+        x = self.fc(x)
+        return x
+
+
+# ---------------------------------------------------------------------------
+# Main Model: DPS + Backbone + Aggregator
+# ---------------------------------------------------------------------------
+
+class DPSViTModel(nn.Module):
+    """Complete model: DPS patch selection + ViT backbone + cross-attention aggregator."""
+
     def __init__(self, config, device="cuda"):
         super().__init__()
         self.config = config
-        
-        # Patch embedding: project flattened patches to embedding dimension (no bias)
-        patch_dim = 3 * config.patch_size * config.patch_size  # RGB channels + patch area
-        self.patch_embed_weight = nn.Parameter(torch.empty(config.n_embd, patch_dim, device=device))
-        
-        # Mean pooling over patches (keep simple and effective - no class token)
-        self.cls_token = False
-        
-        num_patches = (config.image_size // config.patch_size) ** 2
-        num_tokens = num_patches  # No class token, just patch tokens
-        
-        self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, config.n_embd, device=device))
-        
-        # Transformer blocks
-        self.blocks = nn.ModuleList([Block(config, i, device=device) for i in range(config.n_layer)])
-        
-        # Classification head: use mean of all patch tokens (no bias)
-        self.head_weight = nn.Parameter(torch.empty(config.num_classes, config.n_embd, device=device))
-        
-        # Residual and x0 lambdas per layer (same as GPT)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer, device=device))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer, device=device))
 
-    def init_weights(self):
-        # Patch embedding init
-        torch.nn.init.normal_(self.patch_embed_weight, mean=0.0, std=0.02)
-        
-        # Positional embedding init
-        self.pos_embed.data.normal_(mean=0.0, std=0.01)
-        
-        # Transformer blocks
-        n_embd = self.config.n_embd
-        s = 3**0.5 * n_embd**-0.5
-        
-        for block in self.blocks:
-            torch.nn.init.uniform_(block.attn.c_q_weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_k_weight, -s, s)
-            torch.nn.init.uniform_(block.attn.c_v_weight, -s, s)
-            torch.nn.init.zeros_(block.attn.c_proj_weight)
-            torch.nn.init.uniform_(block.mlp.c_fc_weight, -s, s)
-            torch.nn.init.zeros_(block.mlp.c_proj_weight)
-        
-        # Head init
-        self.head_weight.data.normal_(mean=0.0, std=0.01)
-        
-        # Per-layer scalars (use data access to avoid in-place grad op error)
-        self.resid_lambdas.data.fill_(1.0)
-        self.x0_lambdas.data.fill_(0.1)
-        
-        # Value embedding init
-        for block in self.blocks:
-            if block.attn.ve_gate_weight is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate_weight)
+        # DPS module
+        self.dps = DPS(
+            n_channels=3,
+            high_size=config.high_size,
+            low_size=config.low_size,
+            score_size=config.score_size,
+            k=config.k,
+            num_samples=config.num_samples,
+            sigma=config.sigma,
+            patch_size=config.patch_size,
+            device="cuda"
+        )
+
+        # Simple ViT backbone for patch feature extraction (from scratch, not pretrained)
+        self.backbone = SimpleViTBackbone(
+            patch_size=config.patch_size,
+            embed_dim=config.backbone_embed_dim,
+            depth=config.backbone_depth,
+            n_heads=config.backbone_heads
+        )
+
+        # Patch aggregator
+        self.aggregator = PatchAggregator(
+            input_dim=config.backbone_embed_dim,
+            num_classes=config.num_classes,
+            n_layer=config.agg_n_layer,
+            n_token=config.agg_n_token,
+            n_head=config.agg_n_head,
+            d_k=config.agg_d_k,
+            d_v=config.agg_d_v,
+            d_model=config.agg_d_model,
+            d_inner=config.agg_d_inner,
+            num_patches=config.k
+        )
 
     def forward(self, x):
         """
-        Forward pass for Vision Transformer.
-        
         Args:
-            x: Input tensor of shape (B, C, H, W) - images with ImageNet normalization
-        
+            x: Input images of shape (B, C, H, W)
         Returns:
             Logits of shape (B, num_classes)
         """
-        # Move input to the same device and dtype as model parameters
-        x = x.to(device=self.patch_embed_weight.device, dtype=self.patch_embed_weight.dtype)
-        
-        B, C, H, W = x.size()
-        
-        # Patchify: (B, C, H, W) -> (B, num_patches, patch_dim)
-        patches = x.unfold(2, self.config.patch_size, self.config.patch_size).unfold(3, 
-                      self.config.patch_size, self.config.patch_size)  # (B, C, nH, nW, p, p)
-        patches = patches.contiguous().view(B, -1, C * self.config.patch_size * self.config.patch_size)
-        
-        # Project to embedding dimension: (B, num_patches, patch_dim) -> (B, num_patches, n_embd)
-        x = F.linear(patches, self.patch_embed_weight)
-        
-        # Add positional embeddings (cast pos_embed to model dtype)
-        x = x + self.pos_embed.to(device=x.device, dtype=x.dtype)
-        
-        # Apply transformer blocks with residual connections
-        x0 = x
-        for i, block in enumerate(self.blocks):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = None  # Value embeddings not used in this simplified version
-            x = block(x, ve)
-        
-        # Mean pooling over all patches (simple and effective for ViT)
-        x = x.mean(dim=1)
-        
-        # Classification head (keep consistent dtype with head weight)
-        logits = F.linear(x, self.head_weight)
-        
+        # Extract patches via DPS
+        patches, indicators = self.dps(x)
+
+        # Get patch features from backbone
+        patch_features = self.backbone(patches)
+
+        # Aggregate patch features
+        logits = self.aggregator(patch_features)
+
         return logits
 
-    def num_scaling_params(self):
-        patch_embed = sum(p.numel() for p in [self.patch_embed_weight])
-        head = sum(p.numel() for p in [self.head_weight])
-        transformer_matrices = sum(p.numel() for p in self.blocks.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = patch_embed + head + transformer_matrices + scalars
-        
-        return {
-            'patch_embed': patch_embed,
-            'head': head,
-            'transformer_matrices': transformer_matrices,
-            'scalars': scalars,
-            'total': total,
-        }
 
-    def estimate_flops(self):
-        """Estimated FLOPs per forward pass."""
-        nparams = sum(p.numel() for p in self.parameters())
-        
-        # Attention FLOPs: 4 * B * T * (n_head * head_dim)^2 / T (non-causal)
-        h = self.config.n_head
-        q = self.config.n_embd // self.config.n_head
-        t = (self.config.image_size // self.config.patch_size) ** 2
-        
-        attn_flops = 4 * h * q * t**2  # Non-causal: full attention matrix
-        
-        return 6 * nparams + attn_flops
+class SimpleViTBackbone(nn.Module):
+    """Simple ViT backbone for processing individual patches.
 
-    def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
-                        weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
-        model_dim = self.config.n_embd
-        
-        # Parameter groups by type
-        head_params = [self.head_weight]
-        patch_embed_params = [self.patch_embed_weight]
-        cls_token_params = [self.class_token] if hasattr(self, 'class_token') else []
-        pos_embed_params = [self.pos_embed]
-        matrix_params = list(self.blocks.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
-        
-        assert len(list(self.parameters())) == (len(head_params) + len(patch_embed_params) + 
-            len(cls_token_params) + len(pos_embed_params) + len(matrix_params) + 
-            len(resid_params) + len(x0_params))
-        
-        # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
-        dmodel_lr_scale = (model_dim / 768) ** -0.5
-        print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
-        
-        param_groups = [
-            dict(kind='adamw', params=head_params, lr=unembedding_lr * dmodel_lr_scale, 
-                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=patch_embed_params, lr=embedding_lr * dmodel_lr_scale, 
-                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=cls_token_params, lr=embedding_lr * dmodel_lr_scale, 
-                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=pos_embed_params, lr=embedding_lr * dmodel_lr_scale, 
-                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, 
-                 betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, 
-                 betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
-        ]
-        
-        for shape in sorted({p.shape for p in matrix_params}):
-            group_params = [p for p in matrix_params if p.shape == shape]
-            param_groups.append(dict(
-                kind='muon', params=group_params, lr=matrix_lr,
-                momentum=0.95, ns_steps=5, beta2=0.95, weight_decay=weight_decay,
-            ))
-        
-        optimizer = MuonAdamW(param_groups)
-        for group in optimizer.param_groups:
-            group["initial_lr"] = group["lr"]
-        return optimizer
+    Processes each patch independently and outputs a feature vector.
+    """
+
+    def __init__(self, patch_size=448, embed_dim=512, depth=4, n_heads=8):
+        super().__init__()
+
+        self.patch_size = patch_size
+        self.embed_dim = embed_dim
+
+        # Patch embedding - use fixed kernel size of 16x16 (standard ViT)
+        kernel_size = 16
+        self.patch_embed = nn.Conv2d(3, embed_dim, kernel_size=kernel_size, stride=kernel_size)
+
+        # Number of patches per side after convolution
+        self.num_patches_per_side = (patch_size - kernel_size) // kernel_size + 1
+        self.num_patches = self.num_patches_per_side ** 2
+
+        # Position embeddings
+        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim))
+
+        # Transformer blocks
+        self.blocks = nn.ModuleList([
+            ViTBlock(embed_dim, n_heads) for _ in range(depth)
+        ])
+
+        self.norm = nn.LayerNorm(embed_dim)
+
+        # Global average pooling -> feature vector
+        self.head = nn.Linear(embed_dim, embed_dim)
+
+    def forward(self, x):
+        """
+        Args:
+            x: Patches of shape (B*k, C, patch_size, patch_size)
+        Returns:
+            Features of shape (B*k, embed_dim)
+        """
+        B, C, H, W = x.shape
+
+        # Patch embedding
+        x = self.patch_embed(x)
+        x = x.flatten(2).transpose(1, 2)
+
+        # Add positional embedding
+        x = x + self.pos_embed
+
+        # Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        x = self.norm(x)
+
+        # Global average pooling
+        x = x.mean(dim=1)
+        x = self.head(x)
+
+        return x
 
 
-# ---------------------------------------------------------------------------
-# Optimizer (MuonAdamW, single GPU only) - same as train.py
-# ---------------------------------------------------------------------------
+class ViTBlock(nn.Module):
+    """Standard ViT transformer block."""
 
-polar_express_coeffs = [
-    (8.156554524902461, -22.48329292557795, 15.878769915207462),
-    (4.042929935166739, -2.808917465908714, 0.5000178451051316),
-    (3.8916678022926607, -2.772484153217685, 0.5060648178503393),
-    (3.285753657755655, -2.3681294933425376, 0.46449024233003106),
-    (2.3465413258596377, -1.7097828382687081, 0.42323551169305323),
-]
+    def __init__(self, embed_dim, n_heads, mlp_ratio=4.0, dropout=0.1):
+        super().__init__()
 
-@torch.compile(dynamic=False, fullgraph=True)
-def adamw_step_fused(p, grad, exp_avg, exp_avg_sq, step_t, lr_t, beta1_t, beta2_t, eps_t, wd_t):
-    p.mul_(1 - lr_t * wd_t)
-    exp_avg.lerp_(grad, 1 - beta1_t)
-    exp_avg_sq.lerp_(grad.square(), 1 - beta2_t)
-    bias1 = 1 - beta1_t ** step_t
-    bias2 = 1 - beta2_t ** step_t
-    denom = (exp_avg_sq / bias2).sqrt() + eps_t
-    step_size = lr_t / bias1
-    p.add_(exp_avg / denom, alpha=-step_size)
+        self.norm1 = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, n_heads, dropout=dropout, batch_first=True)
 
-@torch.compile(dynamic=False, fullgraph=True)
-def muon_step_fused(stacked_grads, stacked_params, momentum_buffer, second_momentum_buffer,
-                    momentum_t, lr_t, wd_t, beta2_t, ns_steps, red_dim):
-    # Nesterov momentum
-    momentum = momentum_t.to(stacked_grads.dtype)
-    momentum_buffer.lerp_(stacked_grads, 1 - momentum)
-    g = stacked_grads.lerp_(momentum_buffer, momentum)
-    # Polar express orthogonalization
-    X = g.bfloat16()
-    X = X / (X.norm(dim=(-2, -1), keepdim=True) * 1.02 + 1e-6)
-    if g.size(-2) > g.size(-1):
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X.mT @ X
-            B = b * A + c * (A @ A)
-            X = a * X + X @ B
-    else:
-        for a, b, c in polar_express_coeffs[:ns_steps]:
-            A = X @ X.mT
-            B = b * A + c * (A @ A)
-            X = a * X + B @ X
-    g = X
-    # NorMuon variance reduction
-    beta2 = beta2_t.to(g.dtype)
-    v_mean = g.float().square().mean(dim=red_dim, keepdim=True)
-    red_dim_size = g.size(red_dim)
-    v_norm_sq = v_mean.sum(dim=(-2, -1), keepdim=True) * red_dim_size
-    v_norm = v_norm_sq.sqrt()
-    second_momentum_buffer.lerp_(v_mean.to(dtype=second_momentum_buffer.dtype), 1 - beta2)
-    step_size = second_momentum_buffer.clamp_min(1e-10).rsqrt()
-    scaled_sq_sum = (v_mean * red_dim_size) * step_size.float().square()
-    v_norm_new = scaled_sq_sum.sum(dim=(-2, -1), keepdim=True).sqrt()
-    final_scale = step_size * (v_norm / v_norm_new.clamp_min(1e-10))
-    g = g * final_scale.to(g.dtype)
-    # Cautious weight decay + parameter update
-    lr = lr_t.to(g.dtype)
-    wd = wd_t.to(g.dtype)
-    mask = (g * stacked_params) >= 0
-    stacked_params.sub_(lr * g + lr * wd * stacked_params * mask)
+        self.norm2 = nn.LayerNorm(embed_dim)
+        mlp_hidden_dim = int(embed_dim * mlp_ratio)
+        self.mlp = nn.Sequential(
+            nn.Linear(embed_dim, mlp_hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(mlp_hidden_dim, embed_dim),
+            nn.Dropout(dropout)
+        )
 
-
-class MuonAdamW(torch.optim.Optimizer):
-    """Combined optimizer: Muon for 2D matrix params, AdamW for others."""
-
-    def __init__(self, param_groups):
-        super().__init__(param_groups, defaults={})
-        # 0-D CPU tensors to avoid torch.compile recompilation when values change
-        self._adamw_step_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta1_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_eps_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._adamw_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_momentum_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_lr_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_wd_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-        self._muon_beta2_t = torch.tensor(0.0, dtype=torch.float32, device="cpu")
-
-    def _step_adamw(self, group):
-        for p in group['params']:
-            if p.grad is None:
-                continue
-            grad = p.grad
-            state = self.state[p]
-            if not state:
-                state['step'] = 0
-                state['exp_avg'] = torch.zeros_like(p)
-                state['exp_avg_sq'] = torch.zeros_like(p)
-            state['step'] += 1
-            self._adamw_step_t.fill_(state['step'])
-            self._adamw_lr_t.fill_(group["lr"])
-            self._adamw_beta1_t.fill_(group['betas'][0])
-            self._adamw_beta2_t.fill_(group['betas'][1])
-            self._adamw_eps_t.fill_(group['eps'])
-            self._adamw_wd_t.fill_(group['weight_decay'])
-            adamw_step_fused(p, grad, state['exp_avg'], state['exp_avg_sq'],
-                            self._adamw_step_t, self._adamw_lr_t, self._adamw_beta1_t,
-                            self._adamw_beta2_t, self._adamw_eps_t, self._adamw_wd_t)
-
-    def _step_muon(self, group):
-        params = group['params']
-        if not params:
-            return
-        p = params[0]
-        state = self.state[p]
-        num_params = len(params)
-        shape, device, dtype = p.shape, p.device, p.dtype
-        if "momentum_buffer" not in state:
-            state["momentum_buffer"] = torch.zeros(num_params, *shape, dtype=dtype, device=device)
-        if "second_momentum_buffer" not in state:
-            state_shape = (num_params, shape[-2], 1) if shape[-2] >= shape[-1] else (num_params, 1, shape[-1])
-            state["second_momentum_buffer"] = torch.zeros(state_shape, dtype=dtype, device=device)
-        red_dim = -1 if shape[-2] >= shape[-1] else -2
-        # Replace missing gradients with zeros to allow stacking
-        stacked_grads = torch.stack([p.grad if p.grad is not None else torch.zeros_like(p) for p in params])
-        stacked_params = torch.stack(params)
-        self._muon_momentum_t.fill_(group["momentum"])
-        self._muon_beta2_t.fill_(group["beta2"] if group["beta2"] is not None else 0.0)
-        self._muon_lr_t.fill_(group["lr"] * max(1.0, shape[-2] / shape[-1])**0.5)
-        self._muon_wd_t.fill_(group['weight_decay'])
-        muon_step_fused(stacked_grads, stacked_params,
-                        state["momentum_buffer"], state["second_momentum_buffer"],
-                        self._muon_momentum_t, self._muon_lr_t, self._muon_wd_t,
-                        self._muon_beta2_t, group["ns_steps"], red_dim)
-        torch._foreach_copy_(params, list(stacked_params.unbind(0)))
-
-    @torch.no_grad()
-    def step(self):
-        for group in self.param_groups:
-            if group['kind'] == 'adamw':
-                self._step_adamw(group)
-            elif group['kind'] == 'muon':
-                self._step_muon(group)
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x), self.norm1(x), self.norm1(x), need_weights=False)[0]
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 # ---------------------------------------------------------------------------
-# Hyperparameters (edit these directly, no CLI flags needed)
+# Model Configuration
 # ---------------------------------------------------------------------------
 
-# Model architecture
-DEPTH = 4               # Number of transformer layers (baseline - fewer layers for faster training)
-ASPECT_RATIO = 96       # multiplier for model dimension
-HEAD_DIM = 128          # attention head dimension
-WINDOW_PATTERN = "SSSL" # sliding window pattern: L=full, S=half context (not used in ViT but kept for consistency)
+@dataclass
+class ModelConfig:
+    # Image configuration - for full AIMS dataset (5100/2 = 2550, then /2 = 1275 after 2x downscale)
+    high_size: tuple = (1275, 1275)  # Half-resolution input
+    low_size: tuple = (448, 448)     # Scaled for scorer
+    score_size: tuple = (12, 12)     # Score map resolution (computed dynamically at runtime)
+    patch_size: int = 224            # Size of extracted patches
 
-# Optimization - adjusted so TOTAL_BATCH_SIZE is divisible by tokens_per_fwdbwd
-TOTAL_BATCH_SIZE = 2**16   # ~64K patches per optimizer step
-EMBEDDING_LR = 0.6         # learning rate for patch embeddings (Adam)
-UNEMBEDDING_LR = 0.004     # learning rate for head (Adam)
-MATRIX_LR = 0.04           # learning rate for matrix parameters (Muon)
-SCALAR_LR = 0.5            # learning rate for per-layer scalars (Adam)
-WEIGHT_DECAY = 0.2         # cautious weight decay for Muon
-ADAM_BETAS = (0.8, 0.95)   # Adam beta1, beta2
-WARMUP_RATIO = 0.0         # fraction of time budget for LR warmup
-WARMDOWN_RATIO = 0.5       # fraction of time budget for LR warmdown
-FINAL_LR_FRAC = 0.0        # final LR as fraction of initial
+    # DPS configuration
+    k: int = 5                       # Number of patches to select
+    num_samples: int = 100           # MC samples for perturbed TopK
+    sigma: float = 0.05              # Perturbation std
 
-DEVICE_BATCH_SIZE = 1024     # per-device batch size (works with patch_size=8: 1024*64=65536)
+    # Backbone configuration
+    backbone_embed_dim: int = 512
+    backbone_depth: int = 4
+    backbone_heads: int = 8
 
-# Safety thresholds
-LOSS_EXPLOSION_THRESHOLD = 1e6  # if training loss exceeds this, issue a warning
+    # Aggregator configuration
+    agg_n_layer: int = 2
+    agg_n_token: int = 1
+    agg_n_head: int = 8
+    agg_d_k: int = 64
+    agg_d_v: int = 64
+    agg_d_model: int = 512
+    agg_d_inner: int = 2048
 
-# Training termination (set NUM_EPOCHS>0 to use epoch-based stopping)
-NUM_EPOCHS = 5
-
-
-# ---------------------------------------------------------------------------
-# Setup: model, optimizer, dataloader
-# ---------------------------------------------------------------------------
-
-t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
-torch.set_float32_matmul_precision("high")
-device = torch.device("cuda")
-autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
-RTX_6000_ADA_BF16_PEAK_FLOPS = 362.5e12
-
-# Load data
-print("Loading training dataset...")
-from prepare import create_cached_dataset, make_dataloader, get_num_classes
-
-train_images, train_labels = create_cached_dataset()
-val_images, val_labels = None, None  # Will load later for evaluation
-
-# Build model config based on target parameter count (~25M)
-def build_model_config(depth):
-    base_dim = depth * ASPECT_RATIO
-    model_dim = ((base_dim + HEAD_DIM - 1) // HEAD_DIM) * HEAD_DIM
-    num_heads = model_dim // HEAD_DIM
-    
-    return ViTConfig(
-        image_size=64, patch_size=8, num_classes=get_num_classes(),
-        n_layer=depth, n_head=num_heads, n_embd=model_dim,
-        window_pattern=WINDOW_PATTERN,
-    )
-
-config = build_model_config(DEPTH)
-print(f"Model config: {asdict(config)}")
-
-# Create model directly on CUDA with parameters initialized on device
-model = VisionTransformer(config, device=device)
-
-# Initialize weights
-model.init_weights()
-
-param_counts = model.num_scaling_params()
-print("Parameter counts:")
-for key, value in param_counts.items():
-    print(f"  {key:24s}: {value:,}")
-num_params = param_counts['total']
-num_flops_per_token = model.estimate_flops()
-print(f"Estimated FLOPs per forward pass: {num_flops_per_token:e}")
-
-# Calculate gradient accumulation steps
-tokens_per_fwdbwd = DEVICE_BATCH_SIZE * (config.image_size // config.patch_size) ** 2  # patches per sample
-assert TOTAL_BATCH_SIZE % tokens_per_fwdbwd == 0
-grad_accum_steps = TOTAL_BATCH_SIZE // tokens_per_fwdbwd
-
-optimizer = model.setup_optimizer(
-    unembedding_lr=UNEMBEDDING_LR,
-    embedding_lr=EMBEDDING_LR,
-    scalar_lr=SCALAR_LR,
-    adam_betas=ADAM_BETAS,
-    matrix_lr=MATRIX_LR,
-    weight_decay=WEIGHT_DECAY,
-)
-
-# model = torch.compile(model, dynamic=False)  # Disabled due to FA3 issues
-
-# Create dataloaders (note: images come as (B, C, H, W), need to reshape for model)
-train_loader = make_dataloader(train_images, train_labels, DEVICE_BATCH_SIZE, shuffle=True)
-train_loader_iter = iter(train_loader)
-
-print(f"Time budget: {TIME_BUDGET}s")
-print(f"Gradient accumulation steps: {grad_accum_steps}")
-
-# Schedules (all based on progress = training_time / TIME_BUDGET)
-
-def get_lr_multiplier(progress):
-    if progress < WARMUP_RATIO:
-        return progress / WARMUP_RATIO if WARMUP_RATIO > 0 else 1.0
-    elif progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
-
-def get_muon_momentum(step):
-    frac = min(step / 300, 1)
-    return (1 - frac) * 0.85 + frac * 0.95
-
-def get_weight_decay(progress):
-    return WEIGHT_DECAY * (1 - progress)
+    # Training configuration
+    num_classes: int = NUM_CLASSES
 
 
 # ---------------------------------------------------------------------------
-# Training loop
+# Hyperparameters
 # ---------------------------------------------------------------------------
 
-t_start_training = time.time()
-smooth_train_loss = 0
-total_training_time = 0
-step = 0
+# Model
+DEPTH = 4
+ASPECT_RATIO = 96
+HEAD_DIM = 128
 
-# Prefetch first batch (handle exhausted iterator)
-try:
-    images, labels = next(train_loader_iter)
-except StopIteration:
-    train_loader_iter = iter(train_loader)
-    images, labels = next(train_loader_iter)
+# Optimization
+TOTAL_BATCH_SIZE = 32
+EMBEDDING_LR = 0.001
+UNEMBEDDING_LR = 0.001
+MATRIX_LR = 0.001
+SCALAR_LR = 0.001
+WEIGHT_DECAY = 0.01
+ADAM_BETAS = (0.9, 0.999)
+WARMUP_RATIO = 0.1
+WARMDOWN_RATIO = 0.5
+FINAL_LR_FRAC = 0.0
 
-# If epoch-based stopping requested, compute optimizer steps per epoch
-samples_per_opt_step = grad_accum_steps * DEVICE_BATCH_SIZE
-dataset_size = len(train_images)
-steps_per_epoch = math.ceil(dataset_size / samples_per_opt_step) if samples_per_opt_step > 0 else 0
-print(f"Dataset size: {dataset_size}, samples/opt-step: {samples_per_opt_step}, steps/epoch: {steps_per_epoch}")
-samples_seen = 0
+DEVICE_BATCH_SIZE = 8  # Batch size - increase if you have enough VRAM
 
-while True:
-    torch.cuda.synchronize()
-    t0 = time.time()
-    
-    for micro_step in range(grad_accum_steps):
-        with autocast_ctx:
-            # Images are already in (B, C, H, W) format from dataloader
-            images_reshaped = images
-            # Move labels to the training device
+
+
+def main():
+    """Main training function."""
+    t_start = time.time()
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+    torch.set_float32_matmul_precision("high")
+    device = "cuda"
+    autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
+
+    # Load data
+    print("Loading training dataset...")
+    train_images, train_labels, class_names = create_cached_dataset()
+    print(f"Loaded {len(train_images)} training images")
+
+    print("Loading validation dataset...")
+    val_images, val_labels, _ = create_val_dataset()
+    print(f"Loaded {len(val_images)} validation images")
+
+    # Build model config
+    config = ModelConfig()
+    print(f"Model config: {asdict(config)}")
+
+    # Create model
+    model = DPSViTModel(config, device="cuda").to(device)
+
+    # Count parameters
+    num_params = sum(p.numel() for p in model.parameters())
+    print(f"Total parameters: {num_params:,}")
+
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=EMBEDDING_LR, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
+
+    # Create dataloaders
+    train_loader = make_dataloader(train_images, train_labels, DEVICE_BATCH_SIZE, shuffle=True)
+    val_loader = make_val_dataloader(val_images, val_labels, DEVICE_BATCH_SIZE)
+
+    print(f"Time budget: {TIME_BUDGET}s")
+    print(f"Device batch size: {DEVICE_BATCH_SIZE}")
+
+    # ---------------------------------------------------------------------------
+    # Training Loop
+    # ---------------------------------------------------------------------------
+
+    smooth_train_loss = 0
+    total_training_time = 0
+    step = 0
+    best_val_acc = 0.0
+
+    while True:
+        torch.cuda.synchronize()
+        t0 = time.time()
+
+        model.train()
+        epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_total = 0
+
+        for images, labels in train_loader:
+            images = images.to(device)
             labels = labels.to(device)
 
-            logits = model(images_reshaped)
-            loss = F.cross_entropy(logits, labels)
-        
-        train_loss = loss.detach()
-        loss = loss / grad_accum_steps
-        loss.backward()
-        
-        try:
-            images, labels = next(train_loader_iter)
-        except StopIteration:
-            train_loader_iter = iter(train_loader)
-            images, labels = next(train_loader_iter)
+            with autocast_ctx:
+                logits = model(images)
+                loss = F.cross_entropy(logits, labels)
 
-    # Progress and schedules
-    progress = min(total_training_time / TIME_BUDGET, 1.0)
-    lrm = get_lr_multiplier(progress)
-    muon_momentum = get_muon_momentum(step)
-    muon_weight_decay = get_weight_decay(progress)
-    
-    for group in optimizer.param_groups:
-        group["lr"] = group["initial_lr"] * lrm
-        if group['kind'] == 'muon':
-            group["momentum"] = muon_momentum
-            group["weight_decay"] = muon_weight_decay
-    
-    optimizer.step()
-    model.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
-    train_loss_f = train_loss.item()
+            epoch_loss += loss.item() * images.size(0)
 
-    # Fast fail: abort if loss is exploding — log a warning but continue training
-    if not torch.isfinite(torch.tensor(train_loss_f)):
-        print("WARN: non-finite loss encountered, continuing training")
-    elif train_loss_f > LOSS_EXPLOSION_THRESHOLD:
-        print(f"WARN: large loss ({train_loss_f:.3f}) > {LOSS_EXPLOSION_THRESHOLD} — continuing training")
+            preds = logits.argmax(dim=-1)
+            epoch_correct += (preds == labels).sum().item()
+            epoch_total += labels.size(0)
 
-    torch.cuda.synchronize()
-    t1 = time.time()
-    dt = t1 - t0
+            step += 1
 
-    if step > 10:
+        # Calculate epoch metrics
+        epoch_loss /= epoch_total
+        epoch_acc = epoch_correct / epoch_total
+
+        torch.cuda.synchronize()
+        t1 = time.time()
+        dt = t1 - t0
         total_training_time += dt
 
-    # Logging
-    ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1))
-    pct_done = 100 * progress
-    tok_per_sec = int(TOTAL_BATCH_SIZE / dt)
-    mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE / dt / RTX_6000_ADA_BF16_PEAK_FLOPS
-    remaining = max(0, TIME_BUDGET - total_training_time)
+        # Logging - print after each epoch
+        ema_beta = 0.9
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * epoch_loss
 
-    print(f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.4f} | lrm: {lrm:.2f} | dt: {dt*1000:.0f}ms | tok/sec: {tok_per_sec:,} | mfu: {mfu:.1f}% | remaining: {remaining:.0f}s    ", end="", flush=True)
+        pct_done = 100 * min(total_training_time / TIME_BUDGET, 1.0)
+        remaining = max(0, TIME_BUDGET - total_training_time)
 
-    # GC management (Python's GC causes ~500ms stalls)
-    if step == 0:
-        gc.collect()
-        gc.freeze()
-        gc.disable()
-    elif (step + 1) % 5000 == 0:
-        gc.collect()
+        print(f"step {step:05d} ({pct_done:.1f}%) | loss: {epoch_loss:.4f} | acc: {epoch_acc:.4f} | dt: {dt:.1f}s | remaining: {remaining:.0f}s", flush=True)
 
-    step += 1
+        # Evaluate on validation set periodically
+        if step % 50 == 0 or total_training_time >= TIME_BUDGET * 0.9:
+            model.eval()
+            torch.cuda.empty_cache()
+            with autocast_ctx:
+                val_acc, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, "cuda")
+            print(f"  Val acc: {val_acc:.4f} ({val_correct}/{val_total})")
 
-    # Time's up — but only stop after warmup steps so we don't count compilation
-    if step > 10 and total_training_time >= TIME_BUDGET:
-        break
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
 
-print()  # newline after \r training log
+        # Time's up
+        if total_training_time >= TIME_BUDGET:
+            break
 
-total_tokens = step * TOTAL_BATCH_SIZE
+    print()  # newline after training log
+
+    # Final evaluation
+    model.eval()
+    with autocast_ctx:
+        final_val_acc, final_val_correct, final_val_total = evaluate_accuracy_with_counts(model, val_loader, "cuda")
+
+    # ---------------------------------------------------------------------------
+    # Final Summary
+    # ---------------------------------------------------------------------------
+
+    t_end = time.time()
+    peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
+
+    print("---")
+    print(f"val_accuracy:     {final_val_acc:.6f}")
+    print(f"val_correct:      {final_val_correct}")
+    print(f"val_total:        {final_val_total}")
+    print(f"best_val_acc:     {best_val_acc:.6f}")
+    print(f"training_seconds: {total_training_time:.1f}")
+    print(f"total_seconds:    {t_end - t_start:.1f}")
+    print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
+    print(f"num_steps:        {step}")
+    print(f"num_params_M:     {num_params / 1e6:.1f}")
 
 
-# Final eval - load validation data
-if val_images is None or val_labels is None:
-    from prepare import create_val_dataset, make_val_dataloader
-    val_images, val_labels = create_val_dataset()
-
-val_loader = make_val_dataloader(val_images, val_labels, DEVICE_BATCH_SIZE)
-
-model.eval()
-with autocast_ctx:
-    val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
-
-
-# Final summary
-t_end = time.time()
-startup_time = t_start_training - t_start
-steady_state_mfu = 100 * num_flops_per_token * TOTAL_BATCH_SIZE * (step - 10) / total_training_time / RTX_6000_ADA_BF16_PEAK_FLOPS if total_training_time > 0 else 0
-peak_vram_mb = torch.cuda.max_memory_allocated() / 1024 / 1024
-
-print("---")
-print(f"val_accuracy:     {val_accuracy:.6f}")  # decimal in [0, 1]
-print(f"val_correct:      {val_correct}")
-print(f"val_total:        {val_total}")
-print(f"training_seconds: {total_training_time:.1f}")
-print(f"total_seconds:    {t_end - t_start:.1f}")
-print(f"peak_vram_mb:     {peak_vram_mb:.1f}")
-print(f"mfu_percent:      {steady_state_mfu:.2f}")
-print(f"total_tokens_M:   {total_tokens / 1e6:.1f}")
-print(f"num_steps:        {step}")
-print(f"num_params_M:     {num_params / 1e6:.1f}")
-print(f"depth:            {DEPTH}")
+if __name__ == "__main__":
+    main()

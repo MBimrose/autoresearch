@@ -1,9 +1,9 @@
 """
 One-time data preparation for autoresearch vision experiments.
-Downloads/organizes TinyImageNet data and creates dataloader.
+Prepares AIMS 3D printer fingerprint dataset from network share.
 
 Usage:
-    uv run prepare_vision.py                  # full prep (index images, create splits)
+    uv run prepare.py                  # full prep (cache images with downscale)
 
 Data is stored in ~/.cache/autoresearch/vision/.
 """
@@ -12,21 +12,27 @@ import os
 import sys
 import time
 import argparse
+import random
 from pathlib import Path
 
 import torch
 from PIL import Image
 import numpy as np
+import torchvision
+from torchvision import transforms
+from tqdm import tqdm
 
 # ---------------------------------------------------------------------------
 # Constants (fixed, do not modify)
 # ---------------------------------------------------------------------------
 
-IMAGE_SIZE = 64           # image resolution (square)
-PATCH_SIZE = 8            # patch size for ViT
-NUM_CLASSES = 200         # TinyImageNet classes
-TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
-EVAL_SAMPLES = 10000        # number of samples for val eval
+DOWNSCALE_FACTOR = 2      # Factor to downscale images by
+NUM_CLASSES = 6           # AIMS dataset has 6 printer classes
+TRAIN_FRACTION = 0.10     # Use only 10% of training data
+TIME_BUDGET = 1200        # 5 minute time budget in seconds
+
+# Dataset configuration for AIMS cellphone dataset
+DATASET_NAME = "aim_3_designs_all_views_cell"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -34,242 +40,319 @@ EVAL_SAMPLES = 10000        # number of samples for val eval
 
 CACHE_DIR = os.path.join(os.path.expanduser("~"), ".cache", "autoresearch")
 VISION_CACHE_DIR = os.path.join(CACHE_DIR, "vision")
-DATA_DIR = Path("data/tiny-imagenet-200")
 
-# Patch and embedding dimensions
-NUM_PATCHES = (IMAGE_SIZE // PATCH_SIZE) ** 2  # 64 patches for 64x64 image with 8x8 patches
+# Network path for AIMS dataset
+# On WSL2, access Windows network shares via /mnt/ or mount the share
+# Alternative: use SMB mount in Linux
+NETWORK_DATASET_PATH = "\\192.17.162.22\home\AIMS\datasets\aim_3_designs_all_views_cell"
+
+# WSL2 mount path (if the share is mounted via /mnt/)
+WSL2_MOUNT_PATH = "/mnt/aim_3_designs_all_views_cell"
+
+# UNC mount path (Linux SMB mount)
+UNC_MOUNT_PATH = "/mnt/192.17.162.22/home/AIMS/datasets/aim_3_designs_all_views_cell"
+
+# Local fallback path (for when network is mounted locally)
+LOCAL_DATASET_PATH = "data/aim_3_designs_all_views_cell"
 
 
 def find_image_files(split="train"):
-    """Find all image files in the specified split folder."""
-    if split == "test":
-        return list(DATA_DIR.glob("test/images/*.JPEG"))
-    elif split == "val":
-        # Validation images are in val/labels and val/images
-        val_dirs = []
-        with open(DATA_DIR / "val" / "val_annotations.txt", "r") as f:
-            for line in f:
-                parts = line.strip().split("\t")
-                if len(parts) >= 2:
-                    filename, wnid = parts[0], parts[1]
-                    val_dirs.append((filename, wnid))
-        return [(DATA_DIR / "val" / "images" / fn, wn) for fn, wn in val_dirs]
-    elif split == "train":
-        # Training images are organized by class subdirectories with images/ inside
-        train_images = []
-        with open(DATA_DIR / "wnids.txt", "r") as f:
-            wnids = [line.strip() for line in f if line.strip()]
-        
-        for wnid in wnids:
-            # Images are in train/wnid/images/*.JPEG (standard TinyImageNet format)
-            class_images_dir = DATA_DIR / "train" / wnid / "images"
-            if class_images_dir.exists():
-                for img_file in class_images_dir.glob("*.JPEG"):
-                    train_images.append((img_file, wnid))
-        return train_images
+    """
+    Find all image files in the specified split folder.
+
+    AIMS dataset structure expected:
+    - aim_3_designs_all_views_cell/
+        - train/
+            - Stratasys450mc-1/
+            - Stratasys450mc-2/
+            - ...
+        - val/
+            - Stratasys450mc-1/
+            - ...
+    """
+    # Try paths in order: mounted network share, local, UNC mount, network share
+    if os.path.exists(WSL2_MOUNT_PATH):
+        base_dir = Path(WSL2_MOUNT_PATH)
+    elif os.path.exists(LOCAL_DATASET_PATH):
+        base_dir = Path(LOCAL_DATASET_PATH)
+    elif os.path.exists(UNC_MOUNT_PATH):
+        base_dir = Path(UNC_MOUNT_PATH)
+    elif os.path.exists(NETWORK_DATASET_PATH):
+        base_dir = Path(NETWORK_DATASET_PATH)
     else:
-        raise ValueError(f"Unknown split: {split}")
+        raise FileNotFoundError(
+            f"Dataset not found at {LOCAL_DATASET_PATH}, {UNC_MOUNT_PATH}, {WSL2_MOUNT_PATH}, or {NETWORK_DATASET_PATH}. "
+            f"Please ensure the AIMS dataset is accessible."
+        )
+
+    split_dir = base_dir / split
+
+    if not split_dir.exists():
+        raise FileNotFoundError(f"Split directory {split_dir} does not exist")
+
+    image_files = []
+    class_names = sorted([d.name for d in split_dir.iterdir() if d.is_dir()])
+
+    print(f"Found classes: {class_names}")
+
+    for class_idx, class_name in enumerate(class_names):
+        class_dir = split_dir / class_name
+        if not class_dir.exists():
+            continue
+
+        # Find all image files
+        for ext in ["*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tiff"]:
+            for img_path in class_dir.glob(ext):
+                image_files.append((img_path, class_idx, class_name))
+
+    return image_files, class_names
 
 
-def build_wnid_to_idx_mapping():
-    """Build mapping from WordNet ID to class index."""
-    with open(DATA_DIR / "wnids.txt", "r") as f:
-        wnids = [line.strip() for line in f if line.strip()]
-    return {wnid: idx for idx, wnid in enumerate(wnids)}
-
-
-def load_val_labels():
-    """Load validation labels from val_annotations.txt."""
-    labels = []
-    with open(DATA_DIR / "val" / "val_annotations.txt", "r") as f:
-        for line in f:
-            parts = line.strip().split("\t")
-            if len(parts) >= 2:
-                filename, wnid = parts[0], parts[1]
-    return labels
-
-
-def preprocess_image(image_path):
-    """Load and preprocess a single image."""
-    img = Image.open(image_path).convert("RGB")
-    # Resize to target size
-    img = img.resize((IMAGE_SIZE, IMAGE_SIZE), Image.LANCZOS)
-    # Convert to numpy array and normalize to [0, 1]
-    arr = np.array(img, dtype=np.float32) / 255.0
-    # Normalize using ImageNet mean/std
-    mean = np.array([0.485, 0.456, 0.406])
-    std = np.array([0.229, 0.224, 0.225])
-    arr = (arr - mean) / std
-    # Transpose to (C, H, W) format
-    return torch.from_numpy(arr.transpose(2, 0, 1))
-
-
-def patchify(image_tensor):
+def preprocess_image(image_path, downscale_factor=2):
     """
-    Patchify an image tensor into patches.
-    
+    Load and preprocess a single image.
+
     Args:
-        image_tensor: Tensor of shape (C, H, W) with ImageNet normalization
-    
+        image_path: Path to the image file
+        downscale_factor: Factor to downscale the image by (default 2)
+
     Returns:
-        Patches tensor of shape (num_patches, C * PATCH_SIZE * PATCH_SIZE)
+        Preprocessed image tensor of shape (C, H//downscale, W//downscale)
     """
-    C, H, W = image_tensor.shape
-    assert H == IMAGE_SIZE and W == IMAGE_SIZE, f"Expected {IMAGE_SIZE}x{IMAGE_SIZE}, got {H}x{W}"
-    
-    # Reshape to (num_patches_H, PATCH_SIZE, num_patches_W, PATCH_SIZE, C)
-    patches = image_tensor.unfold(1, PATCH_SIZE, PATCH_SIZE).unfold(2, PATCH_SIZE, PATCH_SIZE)
-    # Reshape to (num_patches, C * PATCH_SIZE * PATCH_SIZE)
-    patches = patches.contiguous().view(NUM_PATCHES, -1)
-    return patches
+    try:
+        img = Image.open(image_path).convert("RGB")
+    except Exception as e:
+        print(f"Warning: Failed to open {image_path}: {e}")
+        return None
+
+    # Convert to tensor first
+    img_tensor = transforms.ToTensor()(img)  # (C, H, W) in [0, 1]
+
+    # Downscale using bilinear interpolation
+    if downscale_factor > 1:
+        h, w = img_tensor.shape[1], img_tensor.shape[2]
+        new_h, new_w = h // downscale_factor, w // downscale_factor
+        img_tensor = transforms.Resize(
+            (new_h, new_w),
+            interpolation=transforms.InterpolationMode.BILINEAR,
+            antialias=True
+        )(img_tensor)
+
+    # Per-image normalization (normalize each image to zero mean, unit variance)
+    mean = img_tensor.mean(dim=(1, 2), keepdim=True)
+    std = img_tensor.std(dim=(1, 2), keepdim=True) + 1e-6
+    img_tensor = (img_tensor - mean) / std
+
+    return img_tensor
 
 
-def create_cached_dataset(cache_file="dataset_cache.pt"):
+def create_cached_dataset(cache_file="cellphone_train_cache.pt", use_train_fraction=0.10):
     """
     Create a cached dataset from images. This speeds up training by pre-processing.
-    
+
+    Args:
+        cache_file: Name of the cache file
+        use_train_fraction: Fraction of training data to use (default 10%)
+
     Returns:
-        Tuple of (images_tensor, labels_tensor) - images in (B, C, H, W) format
+        Tuple of (images_tensor, labels_tensor, class_names)
+        - images: list of tensors in (C, H', W') format where H'=H/2, W'=W/2
+        - labels: list of class indices
+        - class_names: list of class names
     """
     cache_path = os.path.join(VISION_CACHE_DIR, cache_file)
-    
+
     if os.path.exists(cache_path):
         print(f"Dataset: loading cached dataset from {cache_path}")
-        data = torch.load(cache_path, weights_only=False)
-        return data["images"], data["labels"]
-    
+        data = torch.load(cache_path, weights_only=False, map_location='cpu', mmap=True)
+        return data["images"], data["labels"], data["class_names"]
+
     # Create cache directory
     os.makedirs(VISION_CACHE_DIR, exist_ok=True)
-    
+
     print("Dataset: building training dataset...")
     t0 = time.time()
-    
-    wnid_to_idx = build_wnid_to_idx_mapping()
-    train_images = find_image_files("train")
-    
+
+    train_images, class_names = find_image_files("train")
+
+    print(f"Found {len(train_images)} training images across {len(class_names)} classes")
+
+    # Sample only a fraction of training data
+    if use_train_fraction < 1.0:
+        n_samples = max(1, int(len(train_images) * use_train_fraction))
+        random.seed(42)  # For reproducibility
+        sampled_indices = random.sample(range(len(train_images)), n_samples)
+        train_images = [train_images[i] for i in sampled_indices]
+        print(f"Sampling {use_train_fraction*100:.0f}% of training data: {n_samples} images")
+
     images_list = []
     labels_list = []
-    
-    for img_path, wnid in train_images:
-        if wnid not in wnid_to_idx:
-            continue
+    skipped = 0
+
+    for img_path, label, class_name in tqdm(train_images, desc="Caching training images", unit="img"):
         try:
-            img_tensor = preprocess_image(img_path)
-            # Store as (C, H, W) - will be batched by dataloader
-            images_list.append(img_tensor)
-            labels_list.append(wnid_to_idx[wnid])
+            img_tensor = preprocess_image(img_path, downscale_factor=DOWNSCALE_FACTOR)
+            if img_tensor is not None:
+                images_list.append(img_tensor)
+                labels_list.append(label)
         except Exception as e:
             print(f"Warning: Failed to process {img_path}: {e}")
-    
-    images_tensor = torch.stack(images_list, dim=0)  # (N, C, H, W)
-    labels_tensor = torch.tensor(labels_list, dtype=torch.long)
-    
-    # Save cache
+            skipped += 1
+
+    if skipped > 0:
+        print(f"Skipped {skipped} images due to errors")
+
+    # Don't stack into single tensor - keep as list for variable sizes
+    # Save as list of tensors
     torch.save({
-        "images": images_tensor,
-        "labels": labels_tensor
+        "images": images_list,
+        "labels": torch.tensor(labels_list, dtype=torch.long),
+        "class_names": class_names,
+        "image_shapes": [img.shape for img in images_list],
     }, cache_path)
-    
+
     t1 = time.time()
     print(f"Dataset: built {len(images_list)} samples in {t1 - t0:.1f}s")
-    
-    return images_tensor, labels_tensor
+    print(f"Image shapes vary: {set(img.shape for img in images_list[:10])}")
+
+    return images_list, torch.tensor(labels_list, dtype=torch.long), class_names
 
 
-def create_val_dataset():
-    """Create validation dataset from TinyImageNet val folder."""
-    wnid_to_idx = build_wnid_to_idx_mapping()
-    val_images = find_image_files("val")
-    
+def create_val_dataset(cache_file="cellphone_val_cache.pt"):
+    """
+    Create validation dataset - uses ALL validation images.
+
+    Returns:
+        Tuple of (images_tensor, labels_tensor, class_names)
+    """
+    cache_path = os.path.join(VISION_CACHE_DIR, cache_file)
+
+    if os.path.exists(cache_path):
+        print(f"Validation dataset: loading cached dataset from {cache_path}")
+        data = torch.load(cache_path, weights_only=False, map_location='cpu', mmap=True)
+        return data["images"], data["labels"], data["class_names"]
+
+    os.makedirs(VISION_CACHE_DIR, exist_ok=True)
+
+    print("Validation dataset: building...")
+    t0 = time.time()
+
+    val_images, class_names = find_image_files("val")
+
+    print(f"Found {len(val_images)} validation images")
+
     images_list = []
     labels_list = []
-    
-    for img_info in val_images:
-        if isinstance(img_info, tuple):
-            img_path, wnid = img_info
-        else:
-            img_path = img_info
-        
+    skipped = 0
+
+    for img_path, label, class_name in tqdm(val_images, desc="Caching validation images", unit="img"):
         try:
-            img_tensor = preprocess_image(str(img_path))
-            # Store as (C, H, W) - same format as training data
-            images_list.append(img_tensor)
-            
-            # Get label from filename or use default
-            if isinstance(img_info, tuple):
-                labels_list.append(wnid_to_idx.get(wnid, 0))
+            img_tensor = preprocess_image(img_path, downscale_factor=DOWNSCALE_FACTOR)
+            if img_tensor is not None:
+                images_list.append(img_tensor)
+                labels_list.append(label)
         except Exception as e:
             print(f"Warning: Failed to process {img_path}: {e}")
-    
-    if len(images_list) > 0:
-        images_tensor = torch.stack(images_list[:EVAL_SAMPLES], dim=0)
-        labels_tensor = torch.tensor(labels_list[:EVAL_SAMPLES], dtype=torch.long)
-        return images_tensor, labels_tensor
-    
-    # Never fall back to training samples for validation, this would leak data.
-    raise RuntimeError(
-        "Validation dataset is empty or unreadable. "
-        "Refusing to fall back to training samples. "
-        "Please verify data/tiny-imagenet-200/val and val_annotations.txt."
-    )
+            skipped += 1
+
+    if skipped > 0:
+        print(f"Skipped {skipped} images due to errors")
+
+    torch.save({
+        "images": images_list,
+        "labels": torch.tensor(labels_list, dtype=torch.long),
+        "class_names": class_names,
+        "image_shapes": [img.shape for img in images_list],
+    }, cache_path)
+
+    t1 = time.time()
+    print(f"Validation dataset: built {len(images_list)} samples in {t1 - t0:.1f}s")
+
+    return images_list, torch.tensor(labels_list, dtype=torch.long), class_names
 
 
 # ---------------------------------------------------------------------------
-# Runtime utilities (imported by train_vision.py)
+# Runtime utilities (imported by train.py)
 # ---------------------------------------------------------------------------
 
 class VisionDataset(torch.utils.data.Dataset):
-    """PyTorch dataset for vision images."""
-    
-    def __init__(self, images_tensor, labels_tensor):
-        self.images = images_tensor  # (N, C, H, W)
+    """PyTorch dataset for vision images with variable sizes."""
+
+    def __init__(self, images_list, labels_tensor):
+        self.images = images_list  # List of tensors (C, H, W)
         self.labels = labels_tensor  # (N,)
-    
+
     def __len__(self):
         return len(self.labels)
-    
+
     def __getitem__(self, idx):
         return self.images[idx], self.labels[idx]
 
 
-def make_dataloader(images_tensor, labels_tensor, batch_size, shuffle=True):
-    """Create a DataLoader for the vision dataset."""
-    dataset = VisionDataset(images_tensor, labels_tensor)
+def collate_fn_variable(batch):
+    """
+    Custom collate function for variable-sized images.
+    Pads images to the max size in the batch.
+    """
+    images, labels = zip(*batch)
+
+    # Find max dimensions
+    max_c = max(img.shape[0] for img in images)
+    max_h = max(img.shape[1] for img in images)
+    max_w = max(img.shape[2] for img in images)
+
+    # Pad images to max size
+    padded_images = []
+    for img in images:
+        c, h, w = img.shape
+        pad_h = max_h - h
+        pad_w = max_w - w
+        if pad_h > 0 or pad_w > 0:
+            padded = torch.nn.functional.pad(
+                img,
+                (0, pad_w, 0, pad_h),  # left, right, top, bottom
+                value=0.0
+            )
+        else:
+            padded = img
+        padded_images.append(padded)
+
+    return torch.stack(padded_images, dim=0), torch.stack(labels, dim=0)
+
+
+def make_dataloader(images_list, labels_tensor, batch_size, shuffle=True):
+    """Create a DataLoader for the vision dataset with variable-sized images."""
+    dataset = VisionDataset(images_list, labels_tensor)
     sampler = torch.utils.data.RandomSampler(dataset) if shuffle else None
     return torch.utils.data.DataLoader(
-        dataset, 
-        batch_size=batch_size, 
+        dataset,
+        batch_size=batch_size,
         sampler=sampler,
+        collate_fn=collate_fn_variable,
         num_workers=2,
         pin_memory=True
     )
 
 
-def make_val_dataloader(images_tensor, labels_tensor, batch_size):
+def make_val_dataloader(images_list, labels_tensor, batch_size):
     """Create a validation DataLoader (no shuffling)."""
-    # Images are already in (N, C, H, W) format from create_val_dataset
-    return make_dataloader(images_tensor, labels_tensor, batch_size, shuffle=False)
+    return make_dataloader(images_list, labels_tensor, batch_size, shuffle=False)
 
 
 @torch.no_grad()
 def evaluate_accuracy(model, val_loader, device="cuda"):
     """
     Compute top-1 accuracy on validation set.
-    
-    Args:
-        model: Vision Transformer model in eval mode
-        val_loader: DataLoader for validation data
-        device: Device to run evaluation on
-    
+
     Returns:
         Top-1 accuracy as a decimal in [0, 1].
     """
-    accuracy, _, _ = evaluate_accuracy_with_counts(model, val_loader, device)
+    accuracy, correct, total = evaluate_accuracy_with_counts(model, val_loader, device)
     return accuracy
 
 
 @torch.no_grad()
-def evaluate_accuracy_with_counts(model, val_loader, device="cuda"):
+def evaluate_accuracy_with_counts(model, val_loader, device: str = "cuda"):
     """
     Compute top-1 accuracy and raw counts on the validation set.
 
@@ -279,17 +362,17 @@ def evaluate_accuracy_with_counts(model, val_loader, device="cuda"):
     model.eval()
     correct = 0
     total = 0
-    
+
     for images, labels in val_loader:
         images = images.to(device)
         labels = labels.to(device)
-        
+
         logits = model(images)
         preds = logits.argmax(dim=-1)
-        
+
         correct += (preds == labels).sum().item()
-        total += labels.size(0)  # samples
-    
+        total += labels.size(0)
+
     accuracy = correct / total if total > 0 else 0.0
     return accuracy, correct, total
 
@@ -299,52 +382,62 @@ def get_num_classes():
     return NUM_CLASSES
 
 
+def get_class_names():
+    """Return the class names from the cached dataset."""
+    cache_path = os.path.join(VISION_CACHE_DIR, "cellphone_train_cache.pt")
+    if os.path.exists(cache_path):
+        data = torch.load(cache_path, weights_only=False)
+        return data.get("class_names", [])
+    return []
+
+
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Prepare vision data for autoresearch")
+    parser = argparse.ArgumentParser(description="Prepare AIMS vision data for autoresearch")
     parser.add_argument("--verify", action="store_true", help="Just verify data exists, don't create cache")
+    parser.add_argument("--train-fraction", type=float, default=0.10, help="Fraction of training data to use")
     args = parser.parse_args()
-    
+
     print(f"Cache directory: {VISION_CACHE_DIR}")
-    print(f"Data directory: {DATA_DIR}")
+    print(f"Looking for dataset at: {LOCAL_DATASET_PATH}, {WSL2_MOUNT_PATH}, or {NETWORK_DATASET_PATH}")
     print()
-    
-    # Check if required files exist
-    if not DATA_DIR.exists():
-        print("Error: data/tiny-imagenet-200 directory not found!")
-        print("Please download TinyImageNet dataset and place it in the data folder.")
-        sys.exit(1)
-    
-    train_dir = DATA_DIR / "train"
-    val_dir = DATA_DIR / "val"
-    
+
     if args.verify:
-        if train_dir.exists():
-            print(f"Train directory exists with {len(list(train_dir.glob('*')))} class folders")
+        # Just verify data exists
+        if os.path.exists(LOCAL_DATASET_PATH):
+            base_dir = Path(LOCAL_DATASET_PATH)
+        elif os.path.exists(NETWORK_DATASET_PATH):
+            base_dir = Path(NETWORK_DATASET_PATH)
         else:
-            print("Warning: Train directory not found")
-        
-        if (DATA_DIR / "wnids.txt").exists():
-            with open(DATA_DIR / "wnids.txt", "r") as f:
-                num_classes = len([l for l in f if l.strip()])
-            print(f"Number of classes: {num_classes}")
-        else:
-            print("Warning: wnids.txt not found")
-        
-        if val_dir.exists():
-            print("Validation directory exists")
-        else:
-            print("Warning: Validation directory not found")
+            print("Error: Dataset directory not found!")
+            sys.exit(1)
+
+        for split in ["train", "val"]:
+            split_dir = base_dir / split
+            if split_dir.exists():
+                class_dirs = [d for d in split_dir.iterdir() if d.is_dir()]
+                print(f"{split.capitalize()} directory exists with {len(class_dirs)} class folders")
+            else:
+                print(f"Warning: {split} directory not found")
     else:
-        # Create cached dataset
-        train_images, train_labels = create_cached_dataset()
-        print(f"Training data shape: {train_images.shape}, labels shape: {train_labels.shape}")
-        
-        val_images, val_labels = create_val_dataset()
-        print(f"Validation data shape: {val_images.shape}, labels shape: {val_labels.shape}")
-    
+        # Create cached datasets
+        print("Creating training dataset cache...")
+        train_images, train_labels, class_names = create_cached_dataset(
+            use_train_fraction=args.train_fraction
+        )
+        print(f"Training data: {len(train_images)} samples")
+        print(f"Labels shape: {train_labels.shape}")
+        print(f"Class names: {class_names}")
+        print()
+
+        print("Creating validation dataset cache...")
+        val_images, val_labels, val_class_names = create_val_dataset()
+        print(f"Validation data: {len(val_images)} samples")
+        print(f"Labels shape: {val_labels.shape}")
+        print(f"Class names: {val_class_names}")
+
     print()
     print("Done! Ready to train.")
