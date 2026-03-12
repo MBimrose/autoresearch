@@ -108,16 +108,18 @@ class ResNet(nn.Module):
         }
 
     def estimate_flops(self):
-        # Rough FLOPs estimate for ResNet
-        # Depends on block type and num_blocks
-        base_flops = 4e9  # Base conv FLOPs
-        block_flops = {1: 1e9, 2: 2e9}  # Basic vs Bottleneck
-        total_blocks = sum(RESNET_BLOCKS)
-        return base_flops + total_blocks * 1e9  # ~45M for ResNet-50
+        # Rough FLOPs estimate for ResNet-18
+        # Conv1: 3*64*3*3*64*64 = 8M
+        # Layer1: 2 blocks * 64*64*3*3*64*64 = 16M
+        # Layer2: 2 blocks * 128*32*3*3*128*32 = 8M
+        # Layer3: 2 blocks * 256*16*3*3*256*16 = 2M
+        # Layer4: 2 blocks * 512*8*3*3*512*8 = 0.5M
+        # FC: 512*200 = 0.1M
+        return 35e6  # ~35M FLOPs per forward pass
 
-    def setup_optimizer(self, lr=0.001, beta1=0.9, beta2=0.999, weight_decay=0.05):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=(beta1, beta2),
-                                      weight_decay=weight_decay)
+    def setup_optimizer(self, lr=0.1, momentum=0.9, weight_decay=5e-4):
+        optimizer = torch.optim.SGD(self.parameters(), lr=lr, momentum=momentum,
+                                    weight_decay=weight_decay, nesterov=True)
         for group in optimizer.param_groups:
             group["initial_lr"] = group["lr"]
         return optimizer
@@ -132,19 +134,18 @@ ViTConfig = None
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture: ResNet-18 (2,2,2,2 blocks) - best results so far
-RESNET_BLOCKS = [2, 2, 2, 2]  # ResNet-18 configuration
+# Model architecture: ResNet-18 (2,2,2,2 blocks per layer)
+RESNET_BLOCKS = [2, 2, 2, 2]  # ResNet-18 configuration [2,2,2,2]=18, [3,4,6,3]=34
 BASE_CHANNELS = 64             # Base channel width
 NUM_CLASSES = 200              # TinyImageNet classes
 
-# Optimization - AdamW with cosine annealing
-TOTAL_BATCH_SIZE = 64          # Batch size (best was 64)
-DEVICE_BATCH_SIZE = 32         # Per-device batch size
-LR = 0.1                       # Higher LR for cosine schedule (trying 0.1)
-BETA1 = 0.9                    # Adam beta1
-BETA2 = 0.999                  # Adam beta2
-WEIGHT_DECAY = 0.05            # AdamW weight decay (decoupled)
-WARMDOWN_RATIO = 0.0           # No warmdown, using cosine
+# Optimization - SGD with momentum (standard for ResNets)
+TOTAL_BATCH_SIZE = 32          # Smaller batch = more steps
+DEVICE_BATCH_SIZE = 16         # Per-device batch size
+LR = 0.1                       # Best LR found so far
+MOMENTUM = 0.9                 # SGD momentum (best found)
+WEIGHT_DECAY = 5e-4            # Standard weight decay
+WARMDOWN_RATIO = 0.15          # Fraction of time for LR warmdown
 FINAL_LR_FRAC = 0.0            # Final LR as fraction of initial
 
 # Safety thresholds
@@ -159,8 +160,9 @@ NUM_EPOCHS = 0                 # Use time budget, not epochs
 # ---------------------------------------------------------------------------
 
 t_start = time.time()
-torch.manual_seed(42)
-torch.cuda.manual_seed(42)
+SEED = 1015
+torch.manual_seed(SEED)
+torch.cuda.manual_seed(SEED)
 torch.set_float32_matmul_precision("high")
 device = torch.device("cuda")
 autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.float32)
@@ -193,7 +195,7 @@ print(f"Estimated FLOPs per forward pass: {num_flops_per_token:e}")
 # Calculate gradient accumulation steps
 grad_accum_steps = TOTAL_BATCH_SIZE // DEVICE_BATCH_SIZE
 
-optimizer = model.setup_optimizer(lr=LR, beta1=BETA1, beta2=BETA2, weight_decay=WEIGHT_DECAY)
+optimizer = model.setup_optimizer(lr=LR, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
 
 # Create dataloaders
 train_loader = make_dataloader(train_images, train_labels, DEVICE_BATCH_SIZE, shuffle=True)
@@ -205,9 +207,12 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
 def get_lr_multiplier(progress):
-    # Cosine annealing: LR goes from 1.0 to FINAL_LR_FRAC over the full training
-    import math
-    return FINAL_LR_FRAC + (1.0 - FINAL_LR_FRAC) * (1 + math.cos(math.pi * progress)) / 2
+    # Linear warmdown at the end
+    if progress < 1.0 - WARMDOWN_RATIO:
+        return 1.0
+    else:
+        cooldown = (1.0 - progress) / WARMDOWN_RATIO
+        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY  # Constant weight decay for ResNet
@@ -331,6 +336,14 @@ model.eval()
 with autocast_ctx:
     val_accuracy, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
 
+# Save model weights for ensemble evaluation
+weight_path = f"model_seed{SEED}.pt"
+torch.save({
+    'model_state_dict': model.state_dict(),
+    'val_accuracy': val_accuracy,
+    'seed': SEED,
+}, weight_path)
+print(f"Saved weights to {weight_path}")
 
 # Final summary
 t_end = time.time()

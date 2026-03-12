@@ -22,5 +22,6 @@ dev/
 # Results file
 results.tsv
 *.log
+*.pt
 
 data/
