@@ -142,10 +142,10 @@ NUM_CLASSES = 200              # TinyImageNet classes
 # Optimization - SGD with momentum (standard for ResNets)
 TOTAL_BATCH_SIZE = 512         # Batch size per optimizer step
 DEVICE_BATCH_SIZE = 256        # Per-device batch size
-LR = 0.1                       # Initial learning rate
+LR = 0.2                       # Higher learning rate (ResNet-18 can handle it)
 MOMENTUM = 0.9                 # SGD momentum
-WEIGHT_DECAY = 5e-4            # Weight decay
-WARMDOWN_RATIO = 0.1           # Fraction of time for LR warmdown
+WEIGHT_DECAY = 1e-4            # Lower weight decay
+WARMDOWN_RATIO = 0.15          # Fraction of time for LR warmdown
 FINAL_LR_FRAC = 0.0            # Final LR as fraction of initial
 
 # Safety thresholds
