@@ -96,7 +96,8 @@ class ResNet(nn.Module):
         self.layer3 = self._make_layer(block, base_channels * 4, num_blocks[2], stride=2, device=device)
         self.layer4 = self._make_layer(block, base_channels * 8, num_blocks[3], stride=2, device=device)
 
-        # Classification head
+        # Classification head - store block expansion for later use
+        self.block_expansion = block.expansion
         self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
         self.fc = nn.Linear(base_channels * 8 * block.expansion, num_classes, bias=False, device=device)
 
@@ -105,7 +106,7 @@ class ResNet(nn.Module):
         layers = []
         for stride in strides:
             layers.append(block(self.in_channels, channels, stride, device))
-            self.in_channels = channels
+            self.in_channels = channels * block.expansion
         return nn.Sequential(*layers)
 
     def forward(self, x):
