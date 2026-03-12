@@ -25,7 +25,7 @@ import numpy as np
 IMAGE_SIZE = 64           # image resolution (square)
 PATCH_SIZE = 8            # patch size for ViT
 NUM_CLASSES = 200         # TinyImageNet classes
-TIME_BUDGET = 300         # training time budget in seconds (5 minutes)
+TIME_BUDGET = 600         # training time budget in seconds (10 minutes)
 EVAL_SAMPLES = 10000        # number of samples for val eval
 
 # ---------------------------------------------------------------------------
