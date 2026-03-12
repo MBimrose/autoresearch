@@ -134,15 +134,15 @@ ViTConfig = None
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture: ResNet-18 (2,2,2,2 blocks per layer)
-RESNET_BLOCKS = [2, 2, 2, 2]  # ResNet-18 configuration [2,2,2,2]=18, [3,4,6,3]=34
+# Model architecture: ResNet-50 (3,4,6,3 blocks per layer) - deeper network
+RESNET_BLOCKS = [3, 4, 6, 3]  # ResNet-50 configuration
 BASE_CHANNELS = 64             # Base channel width
 NUM_CLASSES = 200              # TinyImageNet classes
 
 # Optimization - AdamW with higher LR
 TOTAL_BATCH_SIZE = 64          # Batch size
 DEVICE_BATCH_SIZE = 32         # Per-device batch size
-LR = 0.003                     # AdamW learning rate (higher for faster convergence)
+LR = 0.003                     # AdamW learning rate
 BETA1 = 0.9                    # Adam beta1
 BETA2 = 0.999                  # Adam beta2
 WEIGHT_DECAY = 0.05            # AdamW weight decay (decoupled)
