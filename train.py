@@ -108,14 +108,12 @@ class ResNet(nn.Module):
         }
 
     def estimate_flops(self):
-        # Rough FLOPs estimate for ResNet-18
-        # Conv1: 3*64*3*3*64*64 = 8M
-        # Layer1: 2 blocks * 64*64*3*3*64*64 = 16M
-        # Layer2: 2 blocks * 128*32*3*3*128*32 = 8M
-        # Layer3: 2 blocks * 256*16*3*3*256*16 = 2M
-        # Layer4: 2 blocks * 512*8*3*3*512*8 = 0.5M
-        # FC: 512*200 = 0.1M
-        return 35e6  # ~35M FLOPs per forward pass
+        # Rough FLOPs estimate for ResNet
+        # Depends on block type and num_blocks
+        base_flops = 4e9  # Base conv FLOPs
+        block_flops = {1: 1e9, 2: 2e9}  # Basic vs Bottleneck
+        total_blocks = sum(RESNET_BLOCKS)
+        return base_flops + total_blocks * 1e9  # ~45M for ResNet-50
 
     def setup_optimizer(self, lr=0.001, beta1=0.9, beta2=0.999, weight_decay=0.05):
         optimizer = torch.optim.AdamW(self.parameters(), lr=lr, betas=(beta1, beta2),
@@ -134,19 +132,19 @@ ViTConfig = None
 # Hyperparameters (edit these directly, no CLI flags needed)
 # ---------------------------------------------------------------------------
 
-# Model architecture: ResNet-50 (3,4,6,3 blocks per layer) - deeper network
-RESNET_BLOCKS = [3, 4, 6, 3]  # ResNet-50 configuration
+# Model architecture: ResNet-18 (2,2,2,2 blocks) - best results so far
+RESNET_BLOCKS = [2, 2, 2, 2]  # ResNet-18 configuration
 BASE_CHANNELS = 64             # Base channel width
 NUM_CLASSES = 200              # TinyImageNet classes
 
-# Optimization - AdamW with higher LR
-TOTAL_BATCH_SIZE = 64          # Batch size
+# Optimization - AdamW with cosine annealing
+TOTAL_BATCH_SIZE = 64          # Batch size (best was 64)
 DEVICE_BATCH_SIZE = 32         # Per-device batch size
-LR = 0.003                     # AdamW learning rate
+LR = 0.01                      # Higher LR for cosine schedule
 BETA1 = 0.9                    # Adam beta1
 BETA2 = 0.999                  # Adam beta2
 WEIGHT_DECAY = 0.05            # AdamW weight decay (decoupled)
-WARMDOWN_RATIO = 0.1           # Fraction of time for LR warmdown
+WARMDOWN_RATIO = 0.0           # No warmdown, using cosine
 FINAL_LR_FRAC = 0.0            # Final LR as fraction of initial
 
 # Safety thresholds
@@ -207,12 +205,9 @@ print(f"Gradient accumulation steps: {grad_accum_steps}")
 # Schedules (all based on progress = training_time / TIME_BUDGET)
 
 def get_lr_multiplier(progress):
-    # Linear warmdown at the end
-    if progress < 1.0 - WARMDOWN_RATIO:
-        return 1.0
-    else:
-        cooldown = (1.0 - progress) / WARMDOWN_RATIO
-        return cooldown * 1.0 + (1 - cooldown) * FINAL_LR_FRAC
+    # Cosine annealing: LR goes from 1.0 to FINAL_LR_FRAC over the full training
+    import math
+    return FINAL_LR_FRAC + (1.0 - FINAL_LR_FRAC) * (1 + math.cos(math.pi * progress)) / 2
 
 def get_weight_decay(progress):
     return WEIGHT_DECAY  # Constant weight decay for ResNet
