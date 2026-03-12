@@ -140,7 +140,7 @@ NUM_CLASSES = 200              # TinyImageNet classes
 # Optimization - AdamW with cosine annealing
 TOTAL_BATCH_SIZE = 64          # Batch size (best was 64)
 DEVICE_BATCH_SIZE = 32         # Per-device batch size
-LR = 0.01                      # Higher LR for cosine schedule
+LR = 0.1                       # Higher LR for cosine schedule (trying 0.1)
 BETA1 = 0.9                    # Adam beta1
 BETA2 = 0.999                  # Adam beta2
 WEIGHT_DECAY = 0.05            # AdamW weight decay (decoupled)
