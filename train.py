@@ -1,18 +1,14 @@
 """
-ConvNeXt-Large with extended training - targeting 90%+ accuracy.
+ConvNeXt-Large with two-stage training:
+1. First freeze backbone, train head only
+2. Then unfreeze and train full model with lower LR
 
-Key insight: The 6 classes represent different 3D printer models with
-subtle visual differences. The model needs to learn printer-specific
-features that are invariant to viewing angle (azimuth/polar).
-
-Strategy:
-- Lower learning rate for finer convergence
-- Longer cosine schedule (T_max=300) for better optimization
-- More validation checks to track best model
+This allows the head to converge to reasonable values before
+fine-tuning the whole network.
 
 Configuration:
 - Batch size: 8
-- Optimizer: AdamW with LR=0.00003, weight_decay=0.03
+- Optimizer: AdamW with LR=0.0001 (head), 0.00003 (full)
 - Time budget: 3600 seconds (60 minutes)
 
 Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
@@ -35,7 +31,7 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.00003  # Lower LR for finer convergence
+LEARNING_RATE = 0.0001
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
 
@@ -69,9 +65,13 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Optimizer - lower LR, longer schedule
+    # Freeze backbone, train head only first
+    print("Stage 1: Training head only...")
+    for param in model.features.parameters():
+        param.requires_grad = False
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=300)  # Longer schedule
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=50)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
@@ -79,6 +79,7 @@ def main():
     total_training_time = 0
     step = 0
     best_val_acc = 0.0
+    stage = 1
 
     while total_training_time < TIME_BUDGET:
         torch.cuda.synchronize()
@@ -116,7 +117,7 @@ def main():
 
         print(f"step {step:05d} | loss: {epoch_loss:.4f} | acc: {epoch_acc:.4f} | time: {total_training_time:.0f}s", flush=True)
 
-        # Validation - check more frequently
+        # Validation
         if step % 25 == 0 or total_training_time >= TIME_BUDGET * 0.9:
             model.eval()
             with autocast_ctx:
@@ -124,6 +125,15 @@ def main():
             print(f"  Val acc: {val_acc:.4f} ({val_correct}/{val_total})")
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
+
+        # Unfreeze backbone after first validation
+        if stage == 1 and step > 100:
+            print("Stage 2: Unfreezing backbone, training full model with lower LR...")
+            for param in model.features.parameters():
+                param.requires_grad = True
+            optimizer = torch.optim.AdamW(model.parameters(), lr=0.00003, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+            stage = 2
 
         if total_training_time >= TIME_BUDGET:
             break
