@@ -1,13 +1,14 @@
 """
-ConvNeXt-Large with RandAugment - targeting 90%+ accuracy.
+ConvNeXt-Large with light augmentations - targeting 90%+ accuracy.
 Using AdamW optimizer with pretrained ImageNet weights.
 
-Key insight: RandAugment provides consistent regularization for image classification.
+Key insight: Light augmentations (flips, small color jitter) provide regularization
+without distorting the image too much.
 
 Configuration:
 - Batch size: 8
-- Optimizer: AdamW with LR=0.0001 (higher for augmented)
-- RandAugment: num_ops=2, magnitude=9
+- Optimizer: AdamW with LR=0.0001
+- Augmentations: Horizontal flip (50%), small color jitter
 - Time budget: 3600 seconds (60 minutes)
 
 Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
@@ -21,7 +22,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import convnext_large, ConvNeXt_Large_Weights
-from torchvision.transforms import RandAugment
+from torchvision.transforms import ColorJitter
 
 from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts, create_cached_dataset, create_val_dataset, make_val_dataloader, VisionDataset
 
@@ -35,8 +36,8 @@ LEARNING_RATE = 0.0001
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
 
-# RandAugment settings - moderate augmentation
-augment = RandAugment(num_ops=2, magnitude=9)
+# Light color jitter for regularization
+color_jitter = ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)
 
 
 def main():
@@ -68,7 +69,7 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Optimizer - higher LR for augmented training
+    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
@@ -97,9 +98,17 @@ def main():
         epoch_total = 0
 
         for images, labels in train_loader:
-            # Apply RandAugment
-            images = torch.stack([augment(img) for img in images])
-            images = images.to(device)
+            # Apply light augmentations
+            augmented_images = []
+            for img in images:
+                # Horizontal flip (50% chance)
+                if torch.rand(0).item() > 0.5:
+                    img = img.flip(dims=[-1])
+                # Small color jitter
+                img = color_jitter(img)
+                augmented_images.append(img)
+
+            images = torch.stack(augmented_images).to(device)
             labels = labels.to(device)
 
             with autocast_ctx:
