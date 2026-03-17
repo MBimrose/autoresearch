@@ -1,16 +1,14 @@
 """
-ConvNeXt-Large with RandAugment - targeting 90%+ accuracy.
-Using AdamW optimizer with pretrained ImageNet weights.
-
-Key insight: RandAugment provides consistent regularization for image classification.
+Ensemble of 4x ConvNeXt-Large models - averaging predictions for better accuracy.
+Each sub-model has the same architecture but different random initialization of the head.
 
 Configuration:
 - Batch size: 8
-- Optimizer: AdamW with LR=0.0001 (higher for augmented)
-- RandAugment: num_ops=2, magnitude=9
+- Optimizer: AdamW with LR=0.00005, weight_decay=0.03
 - Time budget: 3600 seconds (60 minutes)
+- 4 models ensembled at inference
 
-Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
+Usage: CUDA_VISIBLE_DEVICES=4 uv run train_ensemble2.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -21,9 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import convnext_large, ConvNeXt_Large_Weights
-from torchvision.transforms import RandAugment
 
-from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts, create_cached_dataset, create_val_dataset, make_val_dataloader, VisionDataset
+from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts, create_cached_dataset, create_val_dataset, make_val_dataloader
 
 
 # ---------------------------------------------------------------------------
@@ -31,12 +28,33 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.00005
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
 
-# RandAugment settings - moderate augmentation
-augment = RandAugment(num_ops=2, magnitude=9)
+
+class QuadEnsemble(nn.Module):
+    """Ensemble of 4 ConvNeXt-Large models with shared weights but different heads."""
+    def __init__(self, num_classes):
+        super().__init__()
+        weights = ConvNeXt_Large_Weights.IMAGENET1K_V1
+        # Create 4 models
+        self.models = nn.ModuleList()
+        for i in range(4):
+            model = convnext_large(weights=weights)
+            num_features = model.classifier[-1].in_features
+            model.classifier = nn.Sequential(
+                nn.Flatten(1, -1),
+                nn.Linear(num_features, num_classes)
+            )
+            self.models.append(model)
+
+    def forward(self, x):
+        # Average logits from all 4 models
+        logits = 0
+        for model in self.models:
+            logits += model(x)
+        return logits / 4
 
 
 def main():
@@ -52,35 +70,19 @@ def main():
     val_images, val_labels, _ = create_val_dataset()
     print(f"Train: {len(train_images)}, Val: {len(val_images)}")
 
-    # Model with pretrained weights
-    print("Loading ConvNeXt-Large...")
-    weights = ConvNeXt_Large_Weights.IMAGENET1K_V1
-    model = convnext_large(weights=weights)
-
-    # Replace classifier
-    num_features = model.classifier[-1].in_features
-    model.classifier = nn.Sequential(
-        nn.Flatten(1, -1),
-        nn.Linear(num_features, NUM_CLASSES)
-    )
+    # Ensemble model
+    print("Loading Ensemble of 4x ConvNeXt-Large...")
+    model = QuadEnsemble(NUM_CLASSES)
     model = model.to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Optimizer - higher LR for augmented training
+    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
-    # Custom training with augmentation
-    train_dataset = VisionDataset(train_images, train_labels)
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
+    train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
 
     total_training_time = 0
@@ -97,8 +99,6 @@ def main():
         epoch_total = 0
 
         for images, labels in train_loader:
-            # Apply RandAugment
-            images = torch.stack([augment(img) for img in images])
             images = images.to(device)
             labels = labels.to(device)
 
