@@ -1,12 +1,19 @@
 """
-ConvNeXt-Large baseline - best configuration at 72.2% val accuracy.
-Using AdamW optimizer with pretrained ImageNet weights.
+ConvNeXt-Large with extended training - targeting 90%+ accuracy.
+
+Key insight: The 6 classes represent different 3D printer models with
+subtle visual differences. The model needs to learn printer-specific
+features that are invariant to viewing angle (azimuth/polar).
+
+Strategy:
+- Lower learning rate for finer convergence
+- Longer cosine schedule (T_max=300) for better optimization
+- More validation checks to track best model
 
 Configuration:
 - Batch size: 8
-- Optimizer: AdamW with LR=0.00005, weight_decay=0.03
+- Optimizer: AdamW with LR=0.00003, weight_decay=0.03
 - Time budget: 3600 seconds (60 minutes)
-- No augmentation (clean training)
 
 Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
 """
@@ -28,7 +35,7 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.00005
+LEARNING_RATE = 0.00003  # Lower LR for finer convergence
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
 
@@ -62,9 +69,9 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Optimizer
+    # Optimizer - lower LR, longer schedule
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=300)  # Longer schedule
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
@@ -109,8 +116,8 @@ def main():
 
         print(f"step {step:05d} | loss: {epoch_loss:.4f} | acc: {epoch_acc:.4f} | time: {total_training_time:.0f}s", flush=True)
 
-        # Validation
-        if step % 50 == 0 or total_training_time >= TIME_BUDGET * 0.9:
+        # Validation - check more frequently
+        if step % 25 == 0 or total_training_time >= TIME_BUDGET * 0.9:
             model.eval()
             with autocast_ctx:
                 val_acc, val_correct, val_total = evaluate_accuracy_with_counts(model, val_loader, device)
