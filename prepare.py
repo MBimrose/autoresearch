@@ -28,8 +28,8 @@ from tqdm import tqdm
 
 DOWNSCALE_FACTOR = 2      # Factor to downscale images by
 NUM_CLASSES = 6           # AIMS dataset has 6 printer classes
-TRAIN_FRACTION = 0.10     # Use only 10% of training data
-TIME_BUDGET = 1200        # 5 minute time budget in seconds
+TRAIN_FRACTION = 1.00     # Use only 100% of training data
+TIME_BUDGET = 3600        # 60 minute time budget in seconds
 
 # Dataset configuration for AIMS cellphone dataset
 DATASET_NAME = "aim_3_designs_all_views_cell"
@@ -398,7 +398,7 @@ def get_class_names():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Prepare AIMS vision data for autoresearch")
     parser.add_argument("--verify", action="store_true", help="Just verify data exists, don't create cache")
-    parser.add_argument("--train-fraction", type=float, default=0.10, help="Fraction of training data to use")
+    parser.add_argument("--train-fraction", type=float, default=1.0, help="Fraction of training data to use")
     args = parser.parse_args()
 
     print(f"Cache directory: {VISION_CACHE_DIR}")
