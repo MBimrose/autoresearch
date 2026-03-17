@@ -1,20 +1,14 @@
 """
-ConvNeXt-Large with aggressive augmentation - targeting 90%+ accuracy.
+ConvNeXt-Large with seed=123 - Testing different random seed.
 Using AdamW optimizer with pretrained ImageNet weights.
-
-Key changes from baseline:
-- Mixup augmentation (alpha=0.4)
-- Random horizontal flips
-- Color jitter
-- Longer cosine schedule
 
 Configuration:
 - Batch size: 8
-- Optimizer: AdamW with LR=0.0001, weight_decay=0.03
+- Optimizer: AdamW with LR=0.00005, weight_decay=0.03
 - Time budget: 3600 seconds (60 minutes)
-- Mixup alpha=0.4, augmentations ON
+- Seed: 123 (different from baseline 42)
 
-Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
+Usage: CUDA_VISIBLE_DEVICES=5 uv run train_convnext_seed2.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -34,31 +28,16 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.00005  # Same as baseline
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
-MIXUP_ALPHA = 0.4
-
-
-def mixup_data(x, y, alpha=0.4):
-    """Apply mixup augmentation."""
-    if alpha > 0:
-        lam = torch.distributions.Beta(alpha, alpha).sample().to(x.device)
-    else:
-        lam = 1.0
-
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
 
 
 def main():
     t_start = time.time()
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
+    # Different seed
+    torch.manual_seed(123)
+    torch.cuda.manual_seed(123)
     torch.set_float32_matmul_precision("high")
     device = "cuda"
     autocast_ctx = torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16)
@@ -69,7 +48,7 @@ def main():
     print(f"Train: {len(train_images)}, Val: {len(val_images)}")
 
     # Model with pretrained weights
-    print("Loading ConvNeXt-Large...")
+    print("Loading ConvNeXt-Large (seed=123)...")
     weights = ConvNeXt_Large_Weights.IMAGENET1K_V1
     model = convnext_large(weights=weights)
 
@@ -84,9 +63,9 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Optimizer
+    # Optimizer - same as baseline
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
@@ -108,13 +87,9 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            # Apply mixup augmentation
-            mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
-
             with autocast_ctx:
-                logits = model(mixed_images)
-                # Mixup loss
-                loss = lam * F.cross_entropy(logits, labels_a) + (1 - lam) * F.cross_entropy(logits, labels_b)
+                logits = model(images)
+                loss = F.cross_entropy(logits, labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -122,7 +97,6 @@ def main():
 
             epoch_loss += loss.item() * images.size(0)
             preds = logits.argmax(dim=-1)
-            # For mixup, we count "soft" correct predictions
             epoch_correct += (preds == labels).sum().item()
             epoch_total += labels.size(0)
             step += 1

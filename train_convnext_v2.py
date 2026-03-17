@@ -1,20 +1,14 @@
 """
-ConvNeXt-Large with aggressive augmentation - targeting 90%+ accuracy.
+ConvNeXt-Large v2 - Optimized version with better hyperparameters.
 Using AdamW optimizer with pretrained ImageNet weights.
 
-Key changes from baseline:
-- Mixup augmentation (alpha=0.4)
-- Random horizontal flips
-- Color jitter
-- Longer cosine schedule
-
 Configuration:
-- Batch size: 8
-- Optimizer: AdamW with LR=0.0001, weight_decay=0.03
+- Batch size: 16 (larger batch for stability)
+- Optimizer: AdamW with LR=0.0002, weight_decay=0.01
 - Time budget: 3600 seconds (60 minutes)
-- Mixup alpha=0.4, augmentations ON
+- Label smoothing for regularization
 
-Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
+Usage: CUDA_VISIBLE_DEVICES=5 uv run train_convnext_v2.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -33,26 +27,11 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # Hyperparameters
 # ---------------------------------------------------------------------------
 
-BATCH_SIZE = 8
-LEARNING_RATE = 0.0001
-WEIGHT_DECAY = 0.03
+BATCH_SIZE = 16  # Larger batch
+LEARNING_RATE = 0.0002  # Higher LR
+WEIGHT_DECAY = 0.01  # Lower weight decay
 ADAM_BETAS = (0.9, 0.999)
-MIXUP_ALPHA = 0.4
-
-
-def mixup_data(x, y, alpha=0.4):
-    """Apply mixup augmentation."""
-    if alpha > 0:
-        lam = torch.distributions.Beta(alpha, alpha).sample().to(x.device)
-    else:
-        lam = 1.0
-
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
-
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+LABEL_SMOOTHING = 0.1
 
 
 def main():
@@ -86,7 +65,7 @@ def main():
 
     # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
@@ -108,13 +87,10 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            # Apply mixup augmentation
-            mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
-
             with autocast_ctx:
-                logits = model(mixed_images)
-                # Mixup loss
-                loss = lam * F.cross_entropy(logits, labels_a) + (1 - lam) * F.cross_entropy(logits, labels_b)
+                logits = model(images)
+                # Label smoothing
+                loss = F.cross_entropy(logits, labels, label_smoothing=LABEL_SMOOTHING)
 
             optimizer.zero_grad()
             loss.backward()
@@ -122,7 +98,6 @@ def main():
 
             epoch_loss += loss.item() * images.size(0)
             preds = logits.argmax(dim=-1)
-            # For mixup, we count "soft" correct predictions
             epoch_correct += (preds == labels).sum().item()
             epoch_total += labels.size(0)
             step += 1

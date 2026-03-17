@@ -1,20 +1,14 @@
 """
-ConvNeXt-Large with aggressive augmentation - targeting 90%+ accuracy.
+Ensemble of 2x ConvNeXt-Large - averaging predictions for better accuracy.
 Using AdamW optimizer with pretrained ImageNet weights.
-
-Key changes from baseline:
-- Mixup augmentation (alpha=0.4)
-- Random horizontal flips
-- Color jitter
-- Longer cosine schedule
 
 Configuration:
 - Batch size: 8
 - Optimizer: AdamW with LR=0.0001, weight_decay=0.03
 - Time budget: 3600 seconds (60 minutes)
-- Mixup alpha=0.4, augmentations ON
+- No augmentation (clean training)
 
-Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
+Usage: CUDA_VISIBLE_DEVICES=5 uv run train_ensemble.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -37,22 +31,32 @@ BATCH_SIZE = 8
 LEARNING_RATE = 0.0001
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
-MIXUP_ALPHA = 0.4
 
 
-def mixup_data(x, y, alpha=0.4):
-    """Apply mixup augmentation."""
-    if alpha > 0:
-        lam = torch.distributions.Beta(alpha, alpha).sample().to(x.device)
-    else:
-        lam = 1.0
+class EnsembleModel(nn.Module):
+    """Ensemble of 2 ConvNeXt-Large models."""
+    def __init__(self, num_classes):
+        super().__init__()
+        weights = ConvNeXt_Large_Weights.IMAGENET1K_V1
+        self.model1 = convnext_large(weights=weights)
+        self.model2 = convnext_large(weights=weights)
 
-    batch_size = x.size(0)
-    index = torch.randperm(batch_size).to(x.device)
+        # Replace classifiers
+        num_features = self.model1.classifier[-1].in_features
+        self.model1.classifier = nn.Sequential(
+            nn.Flatten(1, -1),
+            nn.Linear(num_features, num_classes)
+        )
+        self.model2.classifier = nn.Sequential(
+            nn.Flatten(1, -1),
+            nn.Linear(num_features, num_classes)
+        )
 
-    mixed_x = lam * x + (1 - lam) * x[index, :]
-    y_a, y_b = y, y[index]
-    return mixed_x, y_a, y_b, lam
+    def forward(self, x):
+        logits1 = self.model1(x)
+        logits2 = self.model2(x)
+        # Average the logits (not probabilities - better for training)
+        return (logits1 + logits2) / 2
 
 
 def main():
@@ -68,25 +72,17 @@ def main():
     val_images, val_labels, _ = create_val_dataset()
     print(f"Train: {len(train_images)}, Val: {len(val_images)}")
 
-    # Model with pretrained weights
-    print("Loading ConvNeXt-Large...")
-    weights = ConvNeXt_Large_Weights.IMAGENET1K_V1
-    model = convnext_large(weights=weights)
-
-    # Replace classifier
-    num_features = model.classifier[-1].in_features
-    model.classifier = nn.Sequential(
-        nn.Flatten(1, -1),
-        nn.Linear(num_features, NUM_CLASSES)
-    )
+    # Ensemble model
+    print("Loading Ensemble of 2x ConvNeXt-Large...")
+    model = EnsembleModel(NUM_CLASSES)
     model = model.to(device)
 
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # Optimizer
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=200)
+    # Optimizer - lower LR, longer schedule
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE * 0.5, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
@@ -108,13 +104,9 @@ def main():
             images = images.to(device)
             labels = labels.to(device)
 
-            # Apply mixup augmentation
-            mixed_images, labels_a, labels_b, lam = mixup_data(images, labels, MIXUP_ALPHA)
-
             with autocast_ctx:
-                logits = model(mixed_images)
-                # Mixup loss
-                loss = lam * F.cross_entropy(logits, labels_a) + (1 - lam) * F.cross_entropy(logits, labels_b)
+                logits = model(images)
+                loss = F.cross_entropy(logits, labels)
 
             optimizer.zero_grad()
             loss.backward()
@@ -122,7 +114,6 @@ def main():
 
             epoch_loss += loss.item() * images.size(0)
             preds = logits.argmax(dim=-1)
-            # For mixup, we count "soft" correct predictions
             epoch_correct += (preds == labels).sum().item()
             epoch_total += labels.size(0)
             step += 1
