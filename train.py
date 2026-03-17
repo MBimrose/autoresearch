@@ -1,15 +1,12 @@
 """
-ConvNeXt-Large with light augmentations - targeting 90%+ accuracy.
+ConvNeXt-Large baseline - best configuration at 72.2% val accuracy.
 Using AdamW optimizer with pretrained ImageNet weights.
-
-Key insight: Light augmentations (flips, small color jitter) provide regularization
-without distorting the image too much.
 
 Configuration:
 - Batch size: 8
-- Optimizer: AdamW with LR=0.0001
-- Augmentations: Horizontal flip (50%), small color jitter
+- Optimizer: AdamW with LR=0.00005, weight_decay=0.03
 - Time budget: 3600 seconds (60 minutes)
+- No augmentation (clean training)
 
 Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
 """
@@ -22,9 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torchvision.models import convnext_large, ConvNeXt_Large_Weights
-from torchvision.transforms import ColorJitter
 
-from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts, create_cached_dataset, create_val_dataset, make_val_dataloader, VisionDataset
+from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy_with_counts, create_cached_dataset, create_val_dataset, make_val_dataloader
 
 
 # ---------------------------------------------------------------------------
@@ -32,12 +28,9 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.0001
+LEARNING_RATE = 0.00005
 WEIGHT_DECAY = 0.03
 ADAM_BETAS = (0.9, 0.999)
-
-# Light color jitter for regularization
-color_jitter = ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05)
 
 
 def main():
@@ -73,15 +66,7 @@ def main():
     optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
-    # Custom training with augmentation
-    train_dataset = VisionDataset(train_images, train_labels)
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
-        num_workers=2,
-        pin_memory=True
-    )
+    train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
 
     total_training_time = 0
@@ -98,17 +83,7 @@ def main():
         epoch_total = 0
 
         for images, labels in train_loader:
-            # Apply light augmentations
-            augmented_images = []
-            for img in images:
-                # Horizontal flip (50% chance)
-                if torch.rand(0).item() > 0.5:
-                    img = img.flip(dims=[-1])
-                # Small color jitter
-                img = color_jitter(img)
-                augmented_images.append(img)
-
-            images = torch.stack(augmented_images).to(device)
+            images = images.to(device)
             labels = labels.to(device)
 
             with autocast_ctx:
