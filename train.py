@@ -1,13 +1,12 @@
 """
-ConvNeXt-Large with SGD optimizer - testing if SGD outperforms AdamW.
-
-Key insight: SGD with momentum often generalizes better than AdamW for
-fine-tuning on classification tasks.
+ConvNeXt-Large baseline - best configuration at 72.2% val accuracy.
+Using AdamW optimizer with pretrained ImageNet weights.
 
 Configuration:
 - Batch size: 8
-- Optimizer: SGD with LR=0.01, momentum=0.9, weight_decay=0.0001
+- Optimizer: AdamW with LR=0.00005, weight_decay=0.03
 - Time budget: 3600 seconds (60 minutes)
+- No augmentation (clean training)
 
 Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
 """
@@ -29,9 +28,9 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.01
-MOMENTUM = 0.9
-WEIGHT_DECAY = 0.0001  # Much lower for SGD
+LEARNING_RATE = 0.00005
+WEIGHT_DECAY = 0.03
+ADAM_BETAS = (0.9, 0.999)
 
 
 def main():
@@ -63,8 +62,8 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # SGD optimizer - often better generalization than AdamW
-    optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    # Optimizer
+    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY, betas=ADAM_BETAS)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
