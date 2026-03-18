@@ -1,15 +1,14 @@
 """
-ConvNeXt-Large with SGD optimizer - testing if SGD outperforms AdamW.
+ConvNeXt-Large with Adamax optimizer - Adam variant with infinity norm.
 
-Key insight: SGD with momentum often generalizes better than AdamW for
-fine-tuning on classification tasks.
+Key insight: Adamax (Adam with infinity norm) can be more stable for some tasks.
 
 Configuration:
 - Batch size: 8
-- Optimizer: SGD with LR=0.01, momentum=0.9, weight_decay=0.0001
+- Optimizer: Adamax with LR=0.002, beta2=0.999
 - Time budget: 3600 seconds (60 minutes)
 
-Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
+Usage: CUDA_VISIBLE_DEVICES=6 uv run train_adamax.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
@@ -29,9 +28,9 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.01
-MOMENTUM = 0.9
-WEIGHT_DECAY = 0.0001  # Much lower for SGD
+LEARNING_RATE = 0.002
+BETA2 = 0.999
+WEIGHT_DECAY = 0.01
 
 
 def main():
@@ -63,8 +62,8 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # SGD optimizer - often better generalization than AdamW
-    optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    # Adamax optimizer
+    optimizer = torch.optim.Adamax(model.parameters(), lr=LEARNING_RATE, beta2=BETA2, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)

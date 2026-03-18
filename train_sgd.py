@@ -1,21 +1,22 @@
 """
-ConvNeXt-Large with SGD optimizer - testing if SGD outperforms AdamW.
+ConvNeXt-Large with SGD + warmup - testing if SGD with warmup outperforms AdamW.
 
-Key insight: SGD with momentum often generalizes better than AdamW for
-fine-tuning on classification tasks.
+Key insight: SGD with warmup and higher LR can find better minima.
 
 Configuration:
 - Batch size: 8
-- Optimizer: SGD with LR=0.01, momentum=0.9, weight_decay=0.0001
+- Optimizer: SGD with LR=0.05, momentum=0.9, weight_decay=0.0001
+- LR warmup for first 5 epochs, then cosine decay
 - Time budget: 3600 seconds (60 minutes)
 
-Usage: CUDA_VISIBLE_DEVICES=4 uv run train.py
+Usage: CUDA_VISIBLE_DEVICES=5 uv run train_sgd.py
 """
 import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
 
 import time
+import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -29,9 +30,36 @@ from prepare import NUM_CLASSES, TIME_BUDGET, make_dataloader, evaluate_accuracy
 # ---------------------------------------------------------------------------
 
 BATCH_SIZE = 8
-LEARNING_RATE = 0.01
+BASE_LR = 0.05
 MOMENTUM = 0.9
-WEIGHT_DECAY = 0.0001  # Much lower for SGD
+WEIGHT_DECAY = 0.0001
+WARMUP_EPOCHS = 5
+TOTAL_EPOCHS = 100
+
+
+class WarmupCosineLR:
+    def __init__(self, optimizer, base_lr, warmup_epochs, total_epochs, steps_per_epoch):
+        self.optimizer = optimizer
+        self.base_lr = base_lr
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.steps_per_epoch = steps_per_epoch
+        self.step_count = 0
+
+    def get_lr(self, epoch):
+        if epoch < self.warmup_epochs:
+            # Linear warmup
+            return self.base_lr * (epoch + 1) / self.warmup_epochs
+        else:
+            # Cosine decay
+            progress = (epoch - self.warmup_epochs) / (self.total_epochs - self.warmup_epochs)
+            return self.base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+
+    def step(self, epoch):
+        lr = self.get_lr(epoch)
+        for param_group in self.optimizer.param_groups:
+            param_group['lr'] = lr
+        return lr
 
 
 def main():
@@ -63,15 +91,16 @@ def main():
     num_params = sum(p.numel() for p in model.parameters())
     print(f"Parameters: {num_params:,}")
 
-    # SGD optimizer - often better generalization than AdamW
-    optimizer = torch.optim.SGD(model.parameters(), lr=LEARNING_RATE, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
+    # SGD optimizer
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=MOMENTUM, weight_decay=WEIGHT_DECAY)
+    scheduler = WarmupCosineLR(optimizer, BASE_LR, WARMUP_EPOCHS, TOTAL_EPOCHS, len(train_images) // BATCH_SIZE + 1)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)
     val_loader = make_val_dataloader(val_images, val_labels, BATCH_SIZE)
 
     total_training_time = 0
     step = 0
+    epoch = 0
     best_val_acc = 0.0
 
     while total_training_time < TIME_BUDGET:
@@ -82,6 +111,9 @@ def main():
         epoch_loss = 0.0
         epoch_correct = 0
         epoch_total = 0
+
+        # Update learning rate
+        scheduler.step(epoch)
 
         for images, labels in train_loader:
             images = images.to(device)
@@ -101,14 +133,14 @@ def main():
             epoch_total += labels.size(0)
             step += 1
 
-        scheduler.step()
+        epoch += 1
         epoch_loss /= epoch_total
         epoch_acc = epoch_correct / epoch_total
 
         torch.cuda.synchronize()
         total_training_time += time.time() - t0
 
-        print(f"step {step:05d} | loss: {epoch_loss:.4f} | acc: {epoch_acc:.4f} | time: {total_training_time:.0f}s", flush=True)
+        print(f"step {step:05d} | epoch {epoch:03d} | loss: {epoch_loss:.4f} | acc: {epoch_acc:.4f} | lr: {scheduler.get_lr(epoch):.6f} | time: {total_training_time:.0f}s", flush=True)
 
         # Validation
         if step % 50 == 0 or total_training_time >= TIME_BUDGET * 0.9:
