@@ -63,7 +63,7 @@ def main():
     print(f"Parameters: {num_params:,}")
 
     # Adamax optimizer
-    optimizer = torch.optim.Adamax(model.parameters(), lr=LEARNING_RATE, beta2=BETA2, weight_decay=WEIGHT_DECAY)
+    optimizer = torch.optim.Adamax(model.parameters(), lr=LEARNING_RATE, betas=(0.9, BETA2), weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=100)
 
     train_loader = make_dataloader(train_images, train_labels, BATCH_SIZE, shuffle=True)

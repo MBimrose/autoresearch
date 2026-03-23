@@ -139,6 +139,7 @@ def preprocess_image(image_path, downscale_factor=2):
         )(img_tensor)
 
     # Per-image normalization (normalize each image to zero mean, unit variance)
+    # Note: Using per-image normalization as it normalizes out lighting variations
     mean = img_tensor.mean(dim=(1, 2), keepdim=True)
     std = img_tensor.std(dim=(1, 2), keepdim=True) + 1e-6
     img_tensor = (img_tensor - mean) / std
